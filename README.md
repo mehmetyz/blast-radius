@@ -24,7 +24,7 @@ From a rehearsal deploy (`blast-radius-demo`, PR #31 — 11 commits):
 | **Deploy** | Vercel deployed the merge; the agent recorded it automatically (git SHA from the deployment). |
 | **Live check** | Clean traffic seeded. The agent compared against the previous release: **$0.000013 → $0.000317 per request (24×), errors 0% → 16.7% after trigger traffic.** |
 | **Alerts** | Two alerts in the channel, each with a table: cost regression (commit · message · impact · author) and error spike (**error log ↔ commit ↔ author**). The commit titled *"handle special orders"* — whose message says nothing about errors — was caught **from its diff** (it added a payment-hold 503). |
-| **Prediction bridge** | INSIGHT predicted +1567%; live showed +2338%; the 771pp error is recorded in the ledger — the estimate is scored, not forgotten. |
+| **Prediction bridge** | INSIGHT predicted +1567%; live showed +2338%; the 771pp error is recorded in the ledger — the estimate is scored, not forgotten. The miss is honest: the estimate prices the model swap but not the prompt growth in the same PR (input tokens rose with the longer system prompt) — and the ledger keeps that gap visible instead of hiding it. |
 | **Rollback** | A human typed `/blast-radius rollback 460f033` — **only that commit was reverted** (production went back to just before it; quarantine, escalate, and the model swap stayed). Revert deploy recorded, never evaluated, noted in the thread. |
 | **Paper trail** | One postmortem Doc per evaluation (cost regression *and* error spike each get their own), one Ledger Sheet row per evaluation, a Watch Task for every kept deploy. |
 
@@ -116,6 +116,8 @@ PR ──► INSIGHT (per-hunk estimate, PR comment + channel)
 | `DATABASE_PATH` | SQLite location |
 
 `npm run reset` wipes DB, channel, tasks, docs and sheet for a clean rehearsal.
+
+`MIN_REQUESTS` defaults to **5** to keep rehearsals fast; raise it to **20+** for production statistical confidence (the original rehearsal spec used 20).
 
 ## Failure handling
 

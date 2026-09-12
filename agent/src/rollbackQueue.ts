@@ -8,8 +8,8 @@ const rollbackDone = db.prepare(
 );
 
 const enqueue = db.prepare(`
-  INSERT OR IGNORE INTO rollback_intents (sha, filter, requested_by, requested_at, reply_thread, status)
-  VALUES (?, ?, ?, ?, ?, 'pending')
+  INSERT OR IGNORE INTO rollback_intents (sha, filter, requested_by, requested_at, reply_thread, chosen_sha, status)
+  VALUES (?, ?, ?, ?, ?, ?, 'pending')
 `);
 
 const claimNext = db.prepare(`
@@ -53,9 +53,10 @@ export function enqueueRollback(
   requestedBy: string,
   filter?: string | null,
   replyThread?: string | null,
+  chosenSha?: string | null,
 ): boolean {
   const now = new Date().toISOString();
-  const info = enqueue.run(sha, filter ?? null, requestedBy, now, replyThread ?? null);
+  const info = enqueue.run(sha, filter ?? null, requestedBy, now, replyThread ?? null, chosenSha ?? null);
   return Number(info.changes) > 0;
 }
 

@@ -56,7 +56,7 @@ export async function watchApprovals() {
     // keep/watch/status target a DEPLOY sha; rollback targets a COMMIT sha from
     // the suspicious-commits table (production reverts to just before it).
     const hit = parsed.op === "rollback" ? undefined : open.find((row) => matchesSha(parsed.extra, row.sha));
-    let resolved: { deploySha: string; targetSha: string | null } | null = null;
+    let resolved: { deploySha: string; targetSha: string | null; chosenSha: string | null } | null = null;
     if (!hit) {
       if (parsed.op === "rollback") {
         for (const row of open) {
@@ -67,6 +67,7 @@ export async function watchApprovals() {
           resolved = {
             deploySha: row.sha,
             targetSha: idx > 0 ? commits[idx - 1]!.sha : (base?.baseline_sha ?? null),
+            chosenSha: commits[idx]!.sha,
           };
           break;
         }
@@ -74,7 +75,7 @@ export async function watchApprovals() {
         // status works for ANY known deploy — closed deploys too.
         const allDeploys = db.prepare(`SELECT sha, status FROM deploys`).all() as { sha: string; status: string }[];
         const deploy = allDeploys.find((r) => matchesSha(parsed.extra, r.sha));
-        if (deploy) resolved = { deploySha: deploy.sha, targetSha: null };
+        if (deploy) resolved = { deploySha: deploy.sha, targetSha: null, chosenSha: null };
       }
     }
     if (!hit && !resolved) {
@@ -102,6 +103,7 @@ export async function watchApprovals() {
         parsed.extra,
         msg,
         resolved?.targetSha ?? null,
+        resolved?.chosenSha ?? null,
       );
     } catch (err) {
       console.error(`command ${parsed.op} ${hit?.sha.slice(0, 7)}`, err);
@@ -128,9 +130,10 @@ async function handleCommand(
   extra: string,
   msg: ChannelMessage,
   targetSha: string | null,
+  chosenSha: string | null = null,
 ) {
   if (op === "rollback") {
-    const enqueued = enqueueRollback(sha, msg.id, targetSha ?? undefined, msg.thread_id ?? msg.id);
+    const enqueued = enqueueRollback(sha, msg.id, targetSha ?? undefined, msg.thread_id ?? msg.id, chosenSha ?? undefined);
     if (enqueued) {
       console.log(`rollback queued ${sha.slice(0, 7)} target=${targetSha?.slice(0, 7) ?? "previous release"}`);
       const ack = targetSha

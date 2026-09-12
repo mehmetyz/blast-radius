@@ -372,13 +372,14 @@ export async function writePostmortem(
     // The surgical rollback target persists in the intent's filter — refreshes
     // must show the real target, not the evaluation baseline.
     const intentTarget = db
-      .prepare(`SELECT filter FROM rollback_intents WHERE sha = ? AND status = 'done' ORDER BY id DESC LIMIT 1`)
-      .get(sha) as { filter: string | null } | undefined;
+      .prepare(`SELECT filter, chosen_sha FROM rollback_intents WHERE sha = ? AND status = 'done' ORDER BY id DESC LIMIT 1`)
+      .get(sha) as { filter: string | null; chosen_sha: string | null } | undefined;
     const markdown = formatPostmortem({
       ...docInput,
       outcome,
       revertSha: extras.revertSha ?? revertRow?.sha ?? input.revertSha ?? null,
       rollbackTarget: extras.rollbackTarget ?? intentTarget?.filter ?? input.rollbackTarget ?? null,
+      rollbackChosen: intentTarget?.chosen_sha ?? null,
       resolvedAt,
     });
     const title = postmortemTitle({ sha, verdict: snap.verdict, deployedAt: snap.created_at });

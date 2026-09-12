@@ -132,6 +132,7 @@ CREATE TABLE IF NOT EXISTS rollback_intents (
   requested_by TEXT NOT NULL,
   requested_at TEXT NOT NULL,
   reply_thread TEXT,
+  chosen_sha TEXT,
   status TEXT NOT NULL DEFAULT 'pending',
   claim_at TEXT,
   finished_at TEXT,

@@ -154,6 +154,7 @@ export type CopyInput = {
   resolvedAt?: string | null;
   revertSha?: string | null;
   rollbackTarget?: string | null;
+  rollbackChosen?: string | null;
   predictionErrorPp?: number | null;
   errorLog?: { message: string; count: number }[];
   errorPairs?: { error: string; commit_sha: string | null; message: string; author: string | null }[];
@@ -883,9 +884,17 @@ function resolutionLine(input: CopyInput & { outcome: string }): string {
   const sha7 = shortSha(input.sha);
   const o = input.outcome.toLowerCase();
   if (o.includes("rollback") && !o.includes("no")) {
+    const surgical =
+      input.rollbackTarget != null &&
+      input.baseline_sha != null &&
+      input.rollbackTarget !== input.baseline_sha;
+    const revert = input.revertSha ? ` Revert \`${shortSha(input.revertSha)}\`.` : "";
+    if (surgical) {
+      const chosen = shortSha(input.rollbackChosen ?? input.rollbackTarget ?? sha7);
+      return `Human posted \`${cmd("rollback", chosen)}\`. Production reverted to just before that commit — only its change was removed; the rest of the deploy is still live.${revert} Rollback is never automatic.`;
+    }
     const target = input.rollbackTarget ?? input.previousSha;
     const prev = target ? `\`${shortSha(target)}\`` : "the previous release";
-    const revert = input.revertSha ? ` Revert \`${shortSha(input.revertSha)}\`.` : "";
     return `Human posted \`${cmd("rollback", sha7)}\`. Rolled back to ${prev}.${revert} Rollback is never automatic.`;
   }
   if (o === "timeout") {
@@ -1109,6 +1118,15 @@ export function decisionLine(outcome: string, sha7: string, input?: CopyInput): 
     return `Waiting on a human. Type \`${cmd("rollback", sha7)}\` or \`${cmd("keep", sha7)}\`. I will not roll back on my own.`;
   }
   if (o.includes("rollback") && !o.includes("no rollback")) {
+    // Surgical (commit-targeted) rollback: only the chosen commit is gone —
+    // the rest of the deploy, including other verdicts' causes, is still live.
+    const surgical =
+      input?.rollbackTarget != null &&
+      input.baseline_sha != null &&
+      input.rollbackTarget !== input.baseline_sha;
+    if (surgical) {
+      return `↩️ Rolled back to just before \`${shortSha(input!.rollbackTarget!)}\` — the reverted commit's change is gone; the rest of the deploy is still live.`;
+    }
     return `↩️ Rolled back \`${sha7}\` → ${prev}. The revert itself is not evaluated.`;
   }
   if (o === "timeout") {

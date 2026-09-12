@@ -100,6 +100,12 @@ export const db = (() => {
   if (!replyThreadCols.length) {
     instance.exec(`ALTER TABLE rollback_intents ADD COLUMN reply_thread TEXT`);
   }
+  const chosenShaCols = instance
+    .prepare(`SELECT name FROM pragma_table_info('rollback_intents') WHERE name = 'chosen_sha'`)
+    .all();
+  if (!chosenShaCols.length) {
+    instance.exec(`ALTER TABLE rollback_intents ADD COLUMN chosen_sha TEXT`);
+  }
   const evalHistoryTable = instance
     .prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='evaluation_history'`)
     .get();

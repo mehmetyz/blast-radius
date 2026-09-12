@@ -81,6 +81,28 @@ export async function watchApprovals() {
     if (!hit && !resolved) {
       if (parsed.op === "rollback" || parsed.op === "keep" || parsed.op === "watch" || parsed.op === "status") {
         markDelivery(msg.id, "ambiguous");
+        // A commit of a deploy that was already rolled back: say so instead of "no match".
+        if (parsed.op === "rollback") {
+          const done = db
+            .prepare(
+              `SELECT d.sha AS deploy, i.chosen_sha AS chosen
+                 FROM commit_analysis c
+                 JOIN deploys d ON d.sha = c.deploy_sha
+                 LEFT JOIN rollback_intents i ON i.sha = d.sha
+                WHERE c.sha LIKE ? AND d.status = 'rolled_back'
+                ORDER BY i.id DESC LIMIT 1`,
+            )
+            .get(`${parsed.extra}%`) as { deploy: string; chosen: string | null } | undefined;
+          if (done) {
+            const by = done.chosen ? ` by \`rollback ${done.chosen.slice(0, 7)}\`` : "";
+            await replyCommand(
+              msg,
+              done.deploy,
+              `↩️ \`${parsed.extra.slice(0, 7)}\` is already reverted — deploy \`${done.deploy.slice(0, 7)}\` was rolled back${by}. Nothing to do.`,
+            );
+            continue;
+          }
+        }
         try {
           const what = parsed.op === "rollback" ? "commit" : "deploy";
           const openList = open.map((r) => `\`${r.sha.slice(0, 7)}\``).join(", ") || "none";

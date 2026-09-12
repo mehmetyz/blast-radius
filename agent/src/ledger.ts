@@ -412,7 +412,7 @@ export async function writePostmortem(
     // The surgical rollback target persists in the intent's filter — refreshes
     // must show the real target, not the evaluation baseline.
     const intentTarget = db
-      .prepare(`SELECT filter, chosen_sha FROM rollback_intents WHERE sha = ? AND status = 'done' ORDER BY id DESC LIMIT 1`)
+      .prepare(`SELECT filter, chosen_sha FROM rollback_intents WHERE sha = ? ORDER BY id DESC LIMIT 1`)
       .get(sha) as { filter: string | null; chosen_sha: string | null } | undefined;
     const target = extras.rollbackTarget ?? intentTarget?.filter ?? input.rollbackTarget ?? null;
     const chosen = intentTarget?.chosen_sha ?? null;

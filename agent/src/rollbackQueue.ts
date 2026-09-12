@@ -21,7 +21,7 @@ const claimNext = db.prepare(`
       ORDER BY requested_at ASC LIMIT 1
    )
      AND status = 'pending'
-  RETURNING id, sha, filter, requested_by, reply_thread
+  RETURNING id, sha, filter, requested_by, reply_thread, chosen_sha
 `);
 
 const finish = db.prepare(`
@@ -46,6 +46,7 @@ export type RollbackIntent = {
   filter: string | null;
   requested_by: string;
   reply_thread?: string | null;
+  chosen_sha?: string | null;
 };
 
 export function enqueueRollback(
@@ -114,11 +115,13 @@ export async function processRollbackQueue(): Promise<void> {
         } else {
           await replyForIntent(
             intent,
-            formatRollbackReply(intent.sha, {
-              ok: true,
-              previousSha: out.previousSha,
-              revertSha: out.revertSha,
-            }),
+            intent.chosen_sha
+              ? `↩️ **Rolled back** \`${sha7}\` to just before \`${intent.chosen_sha.slice(0, 7)}\` — that commit and everything after it are reverted. The revert is not evaluated.`
+              : formatRollbackReply(intent.sha, {
+                  ok: true,
+                  previousSha: out.previousSha,
+                  revertSha: out.revertSha,
+                }),
           );
         }
       } else {

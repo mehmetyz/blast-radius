@@ -294,6 +294,12 @@ export async function replyInThread(threadId: string, content: string, startsNew
   });
 }
 
+// Reply inside the thread of a specific message (e.g. a human's command) —
+// not in the alert's own thread.
+export async function replyInMessageThread(msg: ChannelMessage, content: string) {
+  return replyInThread(msg.thread_id ?? msg.id, content);
+}
+
 export const YES_OPTION = "Yes, roll back";
 export const NO_OPTION = "No, keep it";
 

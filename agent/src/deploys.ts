@@ -96,7 +96,7 @@ export function recordDeploy(input: RecordDeployInput) {
       .then(({ followUp }) =>
         followUp(
           revertsSha,
-          result("skip", sha.slice(0, 7), "ok — revert deploy recorded. not evaluated."),
+          `↩️ Revert deploy \`${sha.slice(0, 7)}\` recorded. Not evaluated.`,
         ),
       )
       .catch((err) => console.error("revert follow-up", err));

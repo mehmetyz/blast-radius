@@ -89,10 +89,7 @@ const insertHistory = db.prepare(`
      cost_per_req, latency_ms, error_rate, n, created_at)
   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
-const lastHistory = db.prepare(`
-  SELECT verdict, actual_cost_delta_pct, actual_latency_delta_pct, error_rate_delta
-    FROM evaluation_history WHERE sha = ? ORDER BY id DESC LIMIT 1
-`);
+const verdictsFor = db.prepare(`SELECT DISTINCT verdict FROM evaluation_history WHERE sha = ?`);
 
 type Stats = { n: number; cost: number; latency: number; error_rate: number; errors: number };
 export type NamedSpan = {
@@ -218,12 +215,12 @@ function recordHistory(
   summary: string,
   slice: { cost_per_req: number; latency_ms: number; error_rate: number; n: number },
 ) {
-  const last = lastHistory.get(sha) as
-    | { verdict: string }
-    | undefined;
-  // One history row per verdict per deploy: re-evaluations with the same
-  // verdict update the existing postmortem/ledger row instead of duplicating it.
-  if (last && last.verdict === verdict) return;
+  // One history row per verdict per deploy. Open deploys are re-evaluated every
+  // tick and the verdict can flip back and forth as traffic mixes — never record
+  // a verdict twice, and never add an "ok" row to a deploy that already regressed.
+  const seen = (verdictsFor.all(sha) as { verdict: string }[]).map((r) => r.verdict);
+  if (seen.includes(verdict)) return;
+  if (verdict === "ok" && seen.some((v) => v !== "ok")) return;
   insertHistory.run(
     sha,
     baselineSha,

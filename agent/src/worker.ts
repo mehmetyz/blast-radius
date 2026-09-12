@@ -27,6 +27,14 @@ const claim = db.prepare(
 );
 const setStatus = db.prepare(`UPDATE deploys SET status = ? WHERE sha = ?`);
 const getStatus = db.prepare(`SELECT status FROM deploys WHERE sha = ?`);
+// Deploys still waiting on a human keep being watched: traffic that arrives
+// after the first alert can reveal a different regression (e.g. errors after cost).
+const watching = db.prepare(`
+  SELECT d.sha, d.status FROM deploys d
+    JOIN actions a ON a.sha = d.sha
+   WHERE d.origin = 'release' AND d.status IN ('alerted', 'awaiting_approval') AND a.rollback_executed = 0
+`);
+const alertedVerdicts = db.prepare(`SELECT DISTINCT verdict FROM evaluation_history WHERE sha = ?`);
 
 let ticking = false;
 
@@ -57,6 +65,20 @@ export async function tick() {
       if (row?.status === "collecting") setStatus.run("alerted", sha);
       const after = getStatus.get(sha) as { status: string } | undefined;
       console.log(`${after?.status ?? "alerted"} ${sha.slice(0, 7)} ${result.verdict}`);
+    }
+    for (const { sha, status } of watching.all() as { sha: string; status: string }[]) {
+      const seen = new Set((alertedVerdicts.all(sha) as { verdict: string }[]).map((r) => r.verdict));
+      const result = evaluateDeploy(sha);
+      // evaluateDeploy may mark an "ok" re-evaluation as evaluated_ok — an open
+      // approval must stay open until a human decides.
+      setStatus.run(status, sha);
+      if (!result || result.verdict === "ok" || seen.has(result.verdict)) continue;
+      console.log(`new verdict ${result.verdict} on open deploy ${sha.slice(0, 7)}`);
+      try {
+        await runActiveAgent(sha);
+      } catch (err) {
+        console.error(`re-alert failed ${sha}`, err);
+      }
     }
     await watchApprovals();
     await processRollbackQueue();

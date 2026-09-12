@@ -4,13 +4,16 @@ AI agent that **owns** a bad LLM deploy: estimate impact on the PR, verify that 
 
 Heart of the product: **INSIGHT prediction is scored against ACTIVE telemetry.** Example: `predicted +240% cost, actual +238%`. Without INSIGHT there is no bridge.
 
+INSIGHT is not LLM-cost-only. A PR that adds an endpoint or a hot function is estimated too (latency / error risk). ACTIVE verifies those estimates with live spans. ROOT CAUSE runs when production errors spike: which SHA they started after, the cause, a fix, and **every** author on that change.
+
 ## Stack
 
 - TypeScript, Node 22+ (local 26 is fine), Express, SQLite via built-in `node:sqlite`, OpenAI tool calling
 - This repo: `/agent` (webhook + ingest + worker). Run locally; **Dockerfile** is the deploy artifact (no Fly.io).
 - Demo: separate repo `blast-radius-demo` (Next.js 15 on Vercel). **All production-shaped telemetry comes from this app**, driven by `seed-traffic.js` (20+ real requests per deploy).
-- Telemetry field names: `service.version`, `gen_ai.request.model`, `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens` (+ `latency_ms`, optional `error`)
+- Telemetry spans: `kind` = `llm` | `http` | `function`. Fields: `service.version`, `kind`, `name` (route or function), `latency_ms`, optional `error` / `error_message`, optional `request_id`. LLM spans also send `gen_ai.request.model` + token usage.
 - `service.version` **is the git SHA**. That is the join key everywhere, including Ambiguous `thread_key`.
+- One user request may emit several spans (http + llm + function) sharing `request_id`. `deploys.request_count` counts **requests**, not raw span rows.
 
 ## Data model (SQLite)
 
@@ -40,12 +43,15 @@ Heart of the product: **INSIGHT prediction is scored against ACTIVE telemetry.**
 - `id` INTEGER PK
 - `sha` TEXT (`service.version`)
 - `ts` TEXT
+- `kind` TEXT (`llm` | `http` | `function`, default `llm`)
+- `name` TEXT (route or function name)
 - `model` TEXT
 - `input_tokens` INTEGER
 - `output_tokens` INTEGER
 - `latency_ms` INTEGER
 - `error` INTEGER (0/1)
-- `cost_usd` REAL (from static price table)
+- `error_message` TEXT
+- `cost_usd` REAL (LLM spans; from static price table)
 - `request_id` TEXT
 
 **predictions** (INSIGHT) — required for the ACTIVE bridge
@@ -56,7 +62,7 @@ Heart of the product: **INSIGHT prediction is scored against ACTIVE telemetry.**
 - `estimated_cost_delta_pct` REAL
 - `estimated_latency_delta_pct` REAL
 - `rationale` TEXT
-- `suspect_hints` TEXT (JSON: files/models/params changed)
+- `suspect_hints` TEXT (JSON: files, models, params, endpoints, functions, error_risk, authors)
 
 **evaluations**
 - `sha` TEXT PK
@@ -107,15 +113,10 @@ INSIGHT does **not** use this list (one LLM call + `comment_on_pr`). ACTIVE and 
 - `summarize_telemetry(sha: string)` → n, cost_usd, p50/p95 latency, error_rate, by_model
 - `compare_to_baseline(sha: string)` → deltas + predicted-vs-actual if any prediction maps to this deploy
 - `github_compare(base: string, head: string)` → commits, files, PRs, authors
-- `post_message(content: string, thread_key: string, starts_new_block?: boolean)` → Ambiguous chat (`thread_key` = deploy SHA)
-- `create_poll(question: string, options: string[], close_in_minutes: number)` → `poll_id`
-- `get_poll_results(poll_id: string)` → `total_votes`, options + voters
-- `close_poll(poll_id: string)`
-- `append_ledger(values: string[])` → Sheets append
-- `create_task(title: string, assignee_id: string, priority: "low"|"medium"|"high", due_date: string)`
-- `create_postmortem(title: string, markdown: string)`
-- `comment_on_pr(pr_number: number, body: string)`
-- `execute_rollback(sha: string)` — **hard-gated in code** on an approved poll for that SHA; the model cannot bypass it; writes `pending_reverts`
+- `post_message(content: string, thread_key: string, starts_new_block?: boolean)` → Ambiguous chat (`thread_key` = deploy SHA). Follow-ups use `thread_id` of that thread.
+- Channel commands (human, not LLM tools): `/blast-radius rollback {sha}`, `/blast-radius keep {sha}`, `/blast-radius status {sha}`. Agent posts use the same shape for actions; chat copy is human-readable.
+- Sheet title: `Blast Radius Ledger`. Docs: `Post Mortem - {D Mon YYYY HH:MM:SS}`.
+- `execute_rollback(sha: string)` — **hard-gated in code** on a matching `/blast-radius rollback {sha}` command in the channel; the model cannot bypass it; writes `pending_reverts`
 
 Ambiguous client (not tools): base `https://app.ambiguous.ai`, headers `Authorization: Bearer <key>` + `API-Version: 1`. Endpoints as in the kickoff (sheet `id` top-level; range query param is `spec`).
 
@@ -145,16 +146,16 @@ sequenceDiagram
   Worker->>Worker: wait until n greater_equal 20
   Worker->>LLM: ACTIVE tools compare_to_baseline
   alt regression or errors
-    LLM->>Am: alert plus ranked suspects plus predicted vs actual
-    LLM->>Am: approval poll
-    alt poll yes
+    LLM->>Am: /blast-radius active|rootcause in thread_key=sha
+    Am->>Agent: /blast-radius rollback sha
+    alt rollback command
       Agent->>Agent: pending_reverts then execute_rollback
       Agent->>GH: revert or Vercel rollback
       Note over Worker: new revert deploy skipped_revert
-      LLM->>Am: rollback recorded not evaluated
-    else no or timeout
-      Agent->>Am: I did not roll back, still monitoring
-      Agent->>Am: Task for top suspect
+      Agent->>Am: /blast-radius rollback result in same thread
+    else keep command or timeout
+      Agent->>Am: /blast-radius keep — watching, same thread
+      Agent->>Am: /blast-radius watch task
     end
   end
 ```
@@ -163,8 +164,8 @@ sequenceDiagram
 2. `POST /ingest` — auth via `INGEST_TOKEN`. Persist telemetry, bump `request_count`. Traffic source: demo app via `seed-traffic.js`.
 3. Worker loop — ignore `origin=revert`. If `collecting` and `request_count >= 20`, evaluate. Else if superseded and still `< 20` → `insufficient_data` (no alert).
 4. Evaluator writes `evaluations` including predicted-vs-actual. If verdict ≠ `ok`, run agent loop. Alert idempotency: `actions.sha` UNIQUE + Ambiguous `thread_key=sha`.
-5. Ranked **suspect list** (never one culprit), each with confidence.
-6. Poll. Worker watches results / `close_at`. Approval → rollback + pending revert. Else monitoring message + Task.
+5. Ranked **suspect list** (never one culprit). Alert lists **every** author on the compare, not a single owner.
+6. Human types `/blast-radius rollback {sha}` or `/blast-radius keep {sha}` in the same thread. Rollback is never automatic. No command before `COMMAND_MINUTES` → keep + Task.
 7. Failure handling lives in the core path (A1–A3), not in a later optional stage. README must list these scenarios (jury reads README, not the source tree).
 
 HTTP: `GET /health`, `POST /ingest`, `POST /webhooks/github`, `POST /deploys` (Vercel), `GET /deploys/:sha`.
@@ -176,7 +177,7 @@ HTTP: `GET /health`, `POST /ingest`, `POST /webhooks/github`, `POST /deploys` (V
 - **Idempotency** — `processed_events.delivery_id`; `actions.sha` UNIQUE; Ambiguous `thread_key = sha`. Re-runs do not double-post.
 - **Insufficient data** — never evaluate a deploy with `< MIN_REQUESTS` (20). Superseded and still short → `insufficient_data`, no alert.
 - **Revert loop** — `origin=revert` → `skipped_revert`, never evaluated.
-- **No approval** — poll closes; agent does not roll back; “still monitoring” + Task. Rollback is never automatic.
+- **No approval** — no `/blast-radius rollback` command before timeout; agent does not roll back; `/blast-radius keep` in the same thread + Task. Rollback is never automatic.
 - **Bad ingest** — missing token or malformed OTel body rejected; accepted rows are append-only.
 
 A6 is extra drills against this list, not the list itself. If A6 is skipped, this section still appears in README.

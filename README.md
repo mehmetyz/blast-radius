@@ -50,7 +50,7 @@ docker run -d --init --name blast-radius -p 3001:3001 \
   -v blast-radius-data:/data --env-file ./agent/.env blast-radius-agent
 ```
 
-Multi-stage build, non-root user, healthcheck, lockfile-pinned deps, and a build-time `npm audit` gate (fails on high/critical). The image ships **zero secrets**.
+Multi-stage build, base image pinned by digest to the latest patched Node 22, non-root user, healthcheck, lockfile-pinned deps, and a build-time `npm audit` gate (fails on high/critical). The image ships **zero secrets**.
 
 ## Reproduce the demo (≈10 minutes)
 

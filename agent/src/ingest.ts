@@ -2,6 +2,7 @@ import type { Request, Response } from "express";
 import { config } from "./config.js";
 import { db } from "./db.js";
 import { costUsd } from "./pricing.js";
+import { recordDeploy } from "./deploys.js";
 
 const insertTelemetry = db.prepare(`
   INSERT INTO telemetry (sha, ts, model, input_tokens, output_tokens, latency_ms, error, cost_usd, request_id)
@@ -65,7 +66,8 @@ export function ingest(req: Request, res: Response) {
     cost,
     requestId,
   );
-  bumpDeploy.run(sha);
+  const created = recordDeploy({ sha, source: "ingest" });
+  if (created.skipped) bumpDeploy.run(sha);
 
   res.json({ ok: true, sha, cost_usd: cost });
 }

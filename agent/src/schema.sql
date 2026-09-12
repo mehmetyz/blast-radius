@@ -1,3 +1,13 @@
+CREATE TABLE IF NOT EXISTS pull_requests (
+  number INTEGER PRIMARY KEY,
+  head_sha TEXT,
+  title TEXT,
+  author_login TEXT,
+  merged_sha TEXT,
+  state TEXT,
+  updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS processed_events (
   delivery_id TEXT PRIMARY KEY,
   source TEXT NOT NULL,

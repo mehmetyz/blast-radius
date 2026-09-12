@@ -13,6 +13,7 @@
   },
   "dependencies": {
     "express": "^4.21.2",
+    "openai": "^7.13.0",
     "tsx": "^4.19.2"
   },
   "devDependencies": {

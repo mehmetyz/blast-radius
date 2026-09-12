@@ -8,6 +8,7 @@ const PRICES: Record<string, { input: number; output: number }> = {
 const FALLBACK = { input: 1, output: 5 };
 
 export function costUsd(model: string, inputTokens: number, outputTokens: number): number {
-  const p = PRICES[model] ?? FALLBACK;
+  const name = model.includes("/") ? (model.split("/").pop() ?? model) : model;
+  const p = PRICES[name] ?? FALLBACK;
   return (inputTokens * p.input + outputTokens * p.output) / 1_000_000;
 }

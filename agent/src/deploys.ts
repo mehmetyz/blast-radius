@@ -1,1 +1,158 @@
-// A2: POST /deploys — record a release or revert deploy
+import type { Request, Response } from "express";
+import { db } from "./db.js";
+
+const insertEvent = db.prepare(
+  `INSERT OR IGNORE INTO processed_events (delivery_id, source, received_at) VALUES (?, ?, ?)`,
+);
+const getDeploy = db.prepare(`SELECT * FROM deploys WHERE sha = ?`);
+const lastRelease = db.prepare(
+  `SELECT sha FROM deploys WHERE origin = 'release' ORDER BY deployed_at DESC LIMIT 1`,
+);
+const pendingFor = db.prepare(
+  `SELECT id, rolled_back_sha FROM pending_reverts WHERE consumed_at IS NULL ORDER BY id DESC LIMIT 1`,
+);
+const consumePending = db.prepare(
+  `UPDATE pending_reverts SET consumed_at = ? WHERE id = ?`,
+);
+const insertDeploy = db.prepare(`
+  INSERT INTO deploys (sha, previous_sha, deployed_at, origin, reverts_sha, status, request_count, vercel_deployment_id, github_compare_url)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+`);
+const telemetryCount = db.prepare(`SELECT count(*) AS n FROM telemetry WHERE sha = ?`);
+
+export type RecordDeployInput = {
+  sha: string;
+  vercelDeploymentId?: string | null;
+  commitMessage?: string | null;
+  deliveryId?: string | null;
+  source?: "github" | "vercel" | "ingest";
+};
+
+export function alreadyProcessed(deliveryId: string, source: string): boolean {
+  const info = insertEvent.run(deliveryId, source, new Date().toISOString());
+  return Number(info.changes) === 0;
+}
+
+export function recordDeploy(input: RecordDeployInput) {
+  const sha = input.sha.trim();
+  if (!sha) throw new Error("sha required");
+
+  const existing = getDeploy.get(sha) as { sha: string } | undefined;
+  if (existing) {
+    return { sha, skipped: true as const, reason: "already recorded" };
+  }
+
+  const msg = (input.commitMessage ?? "").trim();
+  const pending = pendingFor.get() as { id: number; rolled_back_sha: string } | undefined;
+  const isRevert = /^Revert\b/i.test(msg) || Boolean(pending);
+  const origin = isRevert ? "revert" : "release";
+  const revertsSha = isRevert ? (pending?.rolled_back_sha ?? null) : null;
+  const status = isRevert ? "skipped_revert" : "collecting";
+  const prev = lastRelease.get() as { sha: string } | undefined;
+  const previousSha = prev && prev.sha !== sha ? prev.sha : null;
+  const n = (telemetryCount.get(sha) as { n: number }).n;
+  const now = new Date().toISOString();
+
+  insertDeploy.run(
+    sha,
+    previousSha,
+    now,
+    origin,
+    revertsSha,
+    status,
+    n,
+    input.vercelDeploymentId ?? null,
+    previousSha ? `https://github.com/${process.env.GITHUB_REPO ?? ""}/compare/${previousSha}...${sha}` : null,
+  );
+
+  if (pending && isRevert) consumePending.run(now, pending.id);
+
+  if (input.deliveryId) alreadyProcessed(input.deliveryId, input.source ?? "vercel");
+
+  return { sha, skipped: false as const, origin, previous_sha: previousSha, status, request_count: n };
+}
+
+export function postDeploy(req: Request, res: Response) {
+  const token =
+    req.get("authorization")?.replace(/^Bearer\s+/i, "") ?? req.get("x-ingest-token") ?? "";
+  const expected = process.env.INGEST_TOKEN ?? "";
+  if (!expected || token !== expected) {
+    res.status(401).json({ error: "unauthorized" });
+    return;
+  }
+
+  const sha = String((req.body as { sha?: unknown })?.sha ?? "").trim();
+  if (!sha) {
+    res.status(400).json({ error: "sha required" });
+    return;
+  }
+  const body = req.body as {
+    vercel_deployment_id?: string;
+    commit_message?: string;
+  };
+  res.json(
+    recordDeploy({
+      sha,
+      vercelDeploymentId: body.vercel_deployment_id,
+      commitMessage: body.commit_message,
+      source: "vercel",
+    }),
+  );
+}
+
+export function getDeployBySha(req: Request, res: Response) {
+  const row = getDeploy.get(req.params.sha);
+  if (!row) {
+    res.status(404).json({ error: "not found" });
+    return;
+  }
+  res.json(row);
+}
+
+export function vercelWebhook(req: Request, res: Response) {
+  const token = String(req.query.token ?? "");
+  const expected = process.env.INGEST_TOKEN ?? "";
+  if (!expected || token !== expected) {
+    res.status(401).json({ error: "unauthorized" });
+    return;
+  }
+
+  const payload = req.body as {
+    id?: string;
+    type?: string;
+    payload?: {
+      deployment?: {
+        id?: string;
+        meta?: { githubCommitSha?: string; githubCommitMessage?: string };
+      };
+    };
+  };
+
+  const type = payload.type ?? "";
+  if (type && type !== "deployment.succeeded") {
+    res.json({ ok: true, ignored: type });
+    return;
+  }
+
+  const sha = payload.payload?.deployment?.meta?.githubCommitSha ?? "";
+  if (!sha) {
+    res.status(400).json({ error: "no githubCommitSha" });
+    return;
+  }
+
+  const deliveryId = payload.id ?? `vercel:${sha}:${payload.payload?.deployment?.id ?? ""}`;
+  if (alreadyProcessed(deliveryId, "vercel")) {
+    res.json({ ok: true, duplicate: true });
+    return;
+  }
+
+  res.json(
+    recordDeploy({
+      sha,
+      vercelDeploymentId: payload.payload?.deployment?.id,
+      commitMessage: payload.payload?.deployment?.meta?.githubCommitMessage,
+      deliveryId,
+      source: "vercel",
+    }),
+  );
+}

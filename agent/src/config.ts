@@ -7,7 +7,9 @@ if (existsSync(".env")) {
 export const config = {
   port: Number(process.env.PORT ?? 3001),
   databasePath: process.env.DATABASE_PATH ?? "./data/blast-radius.db",
-  openaiApiKey: process.env.OPENAI_API_KEY ?? "",
+  openaiApiKey: process.env.OPENAI_API_KEY ?? process.env.LLM_API_KEY ?? "",
+  openaiBaseUrl: process.env.OPENAI_BASE_URL ?? "",
+  llmModel: process.env.LLM_MODEL ?? "openai/gpt-4o-mini",
   ambiguousApiKey: process.env.AMBIGUOUS_API_KEY ?? "",
   ambiguousChannelId: process.env.AMBIGUOUS_CHANNEL_ID ?? "",
   ambiguousSheetId: process.env.AMBIGUOUS_SHEET_ID ?? "",

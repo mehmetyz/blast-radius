@@ -155,6 +155,7 @@ export type CopyInput = {
   revertSha?: string | null;
   rollbackTarget?: string | null;
   rollbackChosen?: string | null;
+  rollbackResolved?: boolean;
   predictionErrorPp?: number | null;
   errorLog?: { message: string; count: number }[];
   errorPairs?: { error: string; commit_sha: string | null; message: string; author: string | null }[];
@@ -674,6 +675,7 @@ export function dominantModel(slice?: CopySlice): string {
 
 export function ledgerOutcome(outcome: string): string {
   const o = outcome.toLowerCase();
+  if (o === "rollback_partial") return "partial";
   if (o.includes("rollback") && !o.includes("no")) return "rolled_back";
   if (o === "keep" || o.includes("monitor")) return "kept";
   if (o === "timeout") return "timeout";
@@ -891,7 +893,9 @@ function resolutionLine(input: CopyInput & { outcome: string }): string {
     const revert = input.revertSha ? ` Revert \`${shortSha(input.revertSha)}\`.` : "";
     if (surgical) {
       const chosen = shortSha(input.rollbackChosen ?? input.rollbackTarget ?? sha7);
-      return `Human posted \`${cmd("rollback", chosen)}\`. Production reverted to just before that commit — only its change was removed; the rest of the deploy is still live.${revert} Rollback is never automatic.`;
+      return input.rollbackResolved
+        ? `Human posted \`${cmd("rollback", chosen)}\`. Production reverted to just before that commit, resolving this regression.${revert} Rollback is never automatic.`
+        : `Human posted \`${cmd("rollback", chosen)}\`. Production reverted to just before that commit — only its change was removed; the rest of the deploy is still live.${revert} Rollback is never automatic.`;
     }
     const target = input.rollbackTarget ?? input.previousSha;
     const prev = target ? `\`${shortSha(target)}\`` : "the previous release";
@@ -1125,7 +1129,9 @@ export function decisionLine(outcome: string, sha7: string, input?: CopyInput): 
       input.baseline_sha != null &&
       input.rollbackTarget !== input.baseline_sha;
     if (surgical) {
-      return `↩️ Rolled back to just before \`${shortSha(input!.rollbackTarget!)}\` — the reverted commit's change is gone; the rest of the deploy is still live.`;
+      return input.rollbackResolved
+        ? `↩️ Rolled back to just before \`${shortSha(input!.rollbackTarget!)}\` — this regression is resolved.`
+        : `↩️ Rolled back to just before \`${shortSha(input!.rollbackTarget!)}\` — the reverted commit's change is gone; the rest of the deploy is still live.`;
     }
     return `↩️ Rolled back \`${sha7}\` → ${prev}. The revert itself is not evaluated.`;
   }

@@ -18,6 +18,7 @@ import {
   ledgerOutcome,
   postmortemTitle,
   prHref,
+  relevantCategories,
   type LedgerFacts,
 } from "./copy.js";
 import { db } from "./db.js";
@@ -209,8 +210,28 @@ async function ledgerGrid(): Promise<string[][]> {
     // decoupled, each with its own snapshot numbers.
     const snaps = getHistoryRows.all(row.sha) as EvalSnap[];
     if (snaps.length) {
+      const intent = db
+        .prepare(`SELECT filter, chosen_sha FROM rollback_intents WHERE sha = ? AND status = 'done' ORDER BY id DESC LIMIT 1`)
+        .get(row.sha) as { filter: string | null; chosen_sha: string | null } | undefined;
       for (const snap of snaps) {
-        rows.push(formatLedgerFacts(await factsForSha(row.sha, outcome, snap)));
+        const analysis = db
+          .prepare(`SELECT sha, category FROM commit_analysis WHERE deploy_sha = ? ORDER BY rowid ASC`)
+          .all(row.sha) as { sha: string; category: string }[];
+        const base = db
+          .prepare(`SELECT baseline_sha FROM evaluations WHERE sha = ?`)
+          .get(row.sha) as { baseline_sha: string | null } | undefined;
+        const snapOutcome =
+          outcome.toLowerCase().includes("rollback") &&
+          !outcome.toLowerCase().includes("no") &&
+          !rollbackResolvesVerdict(
+            { commitAnalysis: analysis, baseline_sha: base?.baseline_sha ?? undefined },
+            snap.verdict,
+            intent?.chosen_sha ?? null,
+            intent?.filter ?? null,
+          )
+            ? "rollback_partial"
+            : outcome;
+        rows.push(formatLedgerFacts(await factsForSha(row.sha, snapOutcome, snap)));
       }
     } else {
       rows.push(formatLedgerFacts(await factsForSha(row.sha, outcome)));
@@ -303,6 +324,25 @@ export async function appendLedgerRow(sha: string, outcome: string) {
   await writeLedgerGrid(await ledgerGrid());
 }
 
+function rollbackResolvesVerdict(
+  input: { commitAnalysis?: { sha: string; category: string }[]; baseline_sha?: string },
+  verdict: string,
+  chosenSha: string | null,
+  targetSha: string | null,
+): boolean {
+  // Whole-deploy rollback (target = baseline) resolves everything.
+  if (!targetSha || !chosenSha) return true;
+  if (targetSha === input.baseline_sha) return true;
+  const analysis = input.commitAnalysis ?? [];
+  const chosenIdx = analysis.findIndex((c) => c.sha.slice(0, 7) === chosenSha.slice(0, 7));
+  if (chosenIdx < 0) return false;
+  // Resolved only when EVERY commit relevant to this verdict is at or after
+  // the reverted commit (i.e. the rollback removed all of them).
+  const relevant = new Set(relevantCategories(verdict));
+  const relevantCommits = analysis.filter((c) => relevant.has(c.category));
+  return relevantCommits.length > 0 && relevantCommits.every((c) => analysis.indexOf(c) >= chosenIdx);
+}
+
 export async function writePostmortem(
   sha: string,
   outcome: string,
@@ -374,12 +414,18 @@ export async function writePostmortem(
     const intentTarget = db
       .prepare(`SELECT filter, chosen_sha FROM rollback_intents WHERE sha = ? AND status = 'done' ORDER BY id DESC LIMIT 1`)
       .get(sha) as { filter: string | null; chosen_sha: string | null } | undefined;
+    const target = extras.rollbackTarget ?? intentTarget?.filter ?? input.rollbackTarget ?? null;
+    const chosen = intentTarget?.chosen_sha ?? null;
     const markdown = formatPostmortem({
       ...docInput,
       outcome,
       revertSha: extras.revertSha ?? revertRow?.sha ?? input.revertSha ?? null,
-      rollbackTarget: extras.rollbackTarget ?? intentTarget?.filter ?? input.rollbackTarget ?? null,
-      rollbackChosen: intentTarget?.chosen_sha ?? null,
+      rollbackTarget: target,
+      rollbackChosen: chosen,
+      rollbackResolved:
+        outcome.toLowerCase().includes("rollback") && !outcome.toLowerCase().includes("no")
+          ? rollbackResolvesVerdict(input, snap.verdict, chosen, target)
+          : undefined,
       resolvedAt,
     });
     const title = postmortemTitle({ sha, verdict: snap.verdict, deployedAt: snap.created_at });

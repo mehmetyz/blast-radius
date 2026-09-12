@@ -31,6 +31,111 @@ export const db = (() => {
   if (!actionColNames.has("resolved_at")) {
     instance.exec(`ALTER TABLE actions ADD COLUMN resolved_at TEXT`);
   }
+  const rollbackTable = instance
+    .prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='rollback_intents'`)
+    .get();
+  if (!rollbackTable) {
+    instance.exec(`
+      CREATE TABLE rollback_intents (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        sha TEXT NOT NULL,
+        filter TEXT,
+        requested_by TEXT NOT NULL,
+        requested_at TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        claim_at TEXT,
+        finished_at TEXT,
+        detail TEXT,
+        UNIQUE(sha, requested_by)
+      );
+      CREATE INDEX rollback_intents_pending ON rollback_intents(status, requested_at);
+    `);
+  }
+  const commitAnalysisTable = instance
+    .prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='commit_analysis'`)
+    .get();
+  if (!commitAnalysisTable) {
+    instance.exec(`
+      CREATE TABLE commit_analysis (
+        sha TEXT PRIMARY KEY,
+        deploy_sha TEXT NOT NULL,
+        baseline_sha TEXT,
+        author_login TEXT,
+        message TEXT,
+        category TEXT,
+        severity TEXT,
+        summary TEXT,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX commit_analysis_deploy ON commit_analysis(deploy_sha);
+    `);
+  }
+  const commitCols = instance
+    .prepare(`SELECT name FROM pragma_table_info('commit_analysis') WHERE name = 'baseline_sha'`)
+    .all();
+  if (!commitCols.length) {
+    instance.exec(`ALTER TABLE commit_analysis ADD COLUMN baseline_sha TEXT`);
+  }
+  const suspectCols = instance
+    .prepare(`SELECT name FROM pragma_table_info('suspects') WHERE name = 'commit_sha'`)
+    .all();
+  if (!suspectCols.length) {
+    instance.exec(`ALTER TABLE suspects ADD COLUMN commit_sha TEXT`);
+  }
+  const actionOutcomeCols = instance
+    .prepare(`SELECT name FROM pragma_table_info('actions') WHERE name = 'outcome'`)
+    .all();
+  if (!actionOutcomeCols.length) {
+    instance.exec(`ALTER TABLE actions ADD COLUMN outcome TEXT`);
+  }
+  const diffBlobCols = instance
+    .prepare(`SELECT name FROM pragma_table_info('commit_analysis') WHERE name = 'diff_blob'`)
+    .all();
+  if (!diffBlobCols.length) {
+    instance.exec(`ALTER TABLE commit_analysis ADD COLUMN diff_blob TEXT`);
+  }
+  const replyThreadCols = instance
+    .prepare(`SELECT name FROM pragma_table_info('rollback_intents') WHERE name = 'reply_thread'`)
+    .all();
+  if (!replyThreadCols.length) {
+    instance.exec(`ALTER TABLE rollback_intents ADD COLUMN reply_thread TEXT`);
+  }
+  const evalHistoryTable = instance
+    .prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='evaluation_history'`)
+    .get();
+  if (!evalHistoryTable) {
+    instance.exec(`
+      CREATE TABLE evaluation_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        sha TEXT NOT NULL,
+        baseline_sha TEXT,
+        verdict TEXT,
+        actual_cost_delta_pct REAL,
+        actual_latency_delta_pct REAL,
+        error_rate_delta REAL,
+        predicted_cost_delta_pct REAL,
+        prediction_error_pp REAL,
+        summary TEXT,
+        cost_per_req REAL,
+        latency_ms REAL,
+        error_rate REAL,
+        n INTEGER,
+        doc_id TEXT,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX evaluation_history_sha ON evaluation_history(sha, id);
+    `);
+  }
+  const snapCols = instance
+    .prepare(`SELECT name FROM pragma_table_info('evaluation_history') WHERE name = 'doc_id'`)
+    .all();
+  if (!snapCols.length) {
+    instance.exec(`ALTER TABLE evaluation_history ADD COLUMN cost_per_req REAL`);
+    instance.exec(`ALTER TABLE evaluation_history ADD COLUMN latency_ms REAL`);
+    instance.exec(`ALTER TABLE evaluation_history ADD COLUMN error_rate REAL`);
+    instance.exec(`ALTER TABLE evaluation_history ADD COLUMN n INTEGER`);
+    instance.exec(`ALTER TABLE evaluation_history ADD COLUMN doc_id TEXT`);
+  }
   return instance;
 })();
 

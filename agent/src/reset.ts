@@ -216,6 +216,8 @@ function wipeSqlite() {
     DELETE FROM predictions;
     DELETE FROM pull_requests;
     DELETE FROM deploys;
+    DELETE FROM rollback_intents;
+    DELETE FROM commit_analysis;
   `);
   console.log("sqlite wiped");
 }

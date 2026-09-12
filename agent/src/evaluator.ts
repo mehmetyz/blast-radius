@@ -52,6 +52,7 @@ const getDeploy = db.prepare(`SELECT * FROM deploys WHERE sha = ?`);
 const previousRelease = db.prepare(`
   SELECT * FROM deploys
   WHERE origin = 'release' AND sha != ? AND request_count >= ?
+    AND deployed_at < (SELECT deployed_at FROM deploys WHERE sha = ?)
   ORDER BY deployed_at DESC LIMIT 1
 `);
 const releasesChrono = db.prepare(`
@@ -80,6 +81,18 @@ const upsertEval = db.prepare(`
     summary = excluded.summary
 `);
 const setStatus = db.prepare(`UPDATE deploys SET status = ? WHERE sha = ?`);
+
+const insertHistory = db.prepare(`
+  INSERT INTO evaluation_history
+    (sha, baseline_sha, verdict, actual_cost_delta_pct, actual_latency_delta_pct,
+     error_rate_delta, predicted_cost_delta_pct, prediction_error_pp, summary,
+     cost_per_req, latency_ms, error_rate, n, created_at)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+`);
+const lastHistory = db.prepare(`
+  SELECT verdict, actual_cost_delta_pct, actual_latency_delta_pct, error_rate_delta
+    FROM evaluation_history WHERE sha = ? ORDER BY id DESC LIMIT 1
+`);
 
 type Stats = { n: number; cost: number; latency: number; error_rate: number; errors: number };
 export type NamedSpan = {
@@ -121,7 +134,9 @@ export function summarizeTelemetry(sha: string) {
   const latSrc = lk === "all" ? all : stats(sha, lk);
   const per = llm.n ? llm.cost / llm.n : 0;
   const latKey = lk === "all" ? null : lk;
-  const lats = (latenciesSql.all(sha, latKey, latKey) as { ms: number }[]).map((r) => r.ms);
+  const lats = (latenciesSql.all(sha, latKey, latKey) as { ms: number }[])
+    .map((r) => r.ms)
+    .sort((a, b) => a - b);
   return {
     sha,
     n: http.n || llm.n || all.n,
@@ -178,7 +193,7 @@ function namedDeltas(current: NamedSpan[], baseline: NamedSpan[]) {
       added.push(s);
       continue;
     }
-    if (s.n >= 5 && b.n >= 5) {
+    if (s.n >= 3 && b.n >= 3) {
       shared.push({
         kind: s.kind,
         name: s.name,
@@ -190,15 +205,65 @@ function namedDeltas(current: NamedSpan[], baseline: NamedSpan[]) {
   return { shared, added };
 }
 
+
+function recordHistory(
+  sha: string,
+  baselineSha: string | null,
+  cost: number,
+  latency: number,
+  errorRate: number,
+  predicted: number | null,
+  predictionError: number | null,
+  verdict: string,
+  summary: string,
+  slice: { cost_per_req: number; latency_ms: number; error_rate: number; n: number },
+) {
+  const last = lastHistory.get(sha) as
+    | { verdict: string; actual_cost_delta_pct: number; actual_latency_delta_pct: number; error_rate_delta: number }
+    | undefined;
+  // Skip when nothing changed since the last recorded evaluation.
+  if (
+    last &&
+    last.verdict === verdict &&
+    Math.abs(last.actual_cost_delta_pct - cost) < 0.01 &&
+    Math.abs(last.actual_latency_delta_pct - latency) < 0.01 &&
+    Math.abs(last.error_rate_delta - errorRate) < 0.0001
+  ) {
+    return;
+  }
+  insertHistory.run(
+    sha,
+    baselineSha,
+    verdict,
+    cost,
+    latency,
+    errorRate,
+    predicted,
+    predictionError,
+    summary,
+    slice.cost_per_req,
+    slice.latency_ms,
+    slice.error_rate,
+    slice.n,
+    new Date().toISOString(),
+  );
+}
+
 export function evaluateDeploy(sha: string) {
   const deploy = getDeploy.get(sha) as { sha: string; origin: string; request_count: number; previous_sha: string | null } | undefined;
   if (!deploy || deploy.origin === "revert") return null;
   if (deploy.request_count < config.minRequests) return null;
 
   const currentSlice = summarizeTelemetry(sha);
-  const baselineRow = previousRelease.get(sha, config.minRequests) as { sha: string } | undefined;
+  const baselineRow = previousRelease.get(sha, config.minRequests, sha) as { sha: string } | undefined;
   if (!baselineRow) {
     setStatus.run("evaluated_ok", sha);
+    recordHistory(sha, null, 0, 0, 0, null, null, "ok", "no baseline with enough traffic", {
+      cost_per_req: 0,
+      latency_ms: 0,
+      error_rate: 0,
+      n: 0,
+    });
     upsertEval.run(sha, null, 0, 0, 0, null, null, "ok", "no baseline with enough traffic");
     return { sha, verdict: "ok" as EvaluationVerdict, skipped: true };
   }
@@ -235,6 +300,7 @@ export function evaluateDeploy(sha: string) {
       : `cost ${costDelta.toFixed(1)}% latency ${latencyDelta.toFixed(1)}% vs ${baselineRow.sha.slice(0, 7)}` +
         (predicted == null ? "" : ` predicted ${predicted}% actual ${costDelta.toFixed(1)}%`);
 
+  recordHistory(sha, baselineRow.sha, costDelta, latencyDelta, errorDelta, predicted, predictionError, verdict, summary, currentSlice);
   upsertEval.run(sha, baselineRow.sha, costDelta, latencyDelta, errorDelta, predicted, predictionError, verdict, summary);
   if (verdict === "ok") setStatus.run("evaluated_ok", sha);
   return {

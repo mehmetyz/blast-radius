@@ -72,11 +72,33 @@ CREATE TABLE IF NOT EXISTS evaluations (
   summary TEXT
 );
 
+CREATE TABLE IF NOT EXISTS evaluation_history (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  sha TEXT NOT NULL,
+  baseline_sha TEXT,
+  verdict TEXT,
+  actual_cost_delta_pct REAL,
+  actual_latency_delta_pct REAL,
+  error_rate_delta REAL,
+  predicted_cost_delta_pct REAL,
+  prediction_error_pp REAL,
+  summary TEXT,
+  cost_per_req REAL,
+  latency_ms REAL,
+  error_rate REAL,
+  n INTEGER,
+  doc_id TEXT,
+  created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS evaluation_history_sha ON evaluation_history(sha, id);
+
 CREATE TABLE IF NOT EXISTS suspects (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   sha TEXT NOT NULL,
   rank INTEGER NOT NULL,
   pr_number INTEGER,
+  commit_sha TEXT,
   author_login TEXT,
   confidence REAL,
   reason TEXT
@@ -92,7 +114,8 @@ CREATE TABLE IF NOT EXISTS actions (
   awaiting_at TEXT,
   doc_hash TEXT,
   doc_title TEXT,
-  resolved_at TEXT
+  resolved_at TEXT,
+  outcome TEXT
 );
 
 CREATE TABLE IF NOT EXISTS remediations (
@@ -101,3 +124,36 @@ CREATE TABLE IF NOT EXISTS remediations (
   root_cause TEXT NOT NULL,
   fix TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS rollback_intents (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  sha TEXT NOT NULL,
+  filter TEXT,
+  requested_by TEXT NOT NULL,
+  requested_at TEXT NOT NULL,
+  reply_thread TEXT,
+  status TEXT NOT NULL DEFAULT 'pending',
+  claim_at TEXT,
+  finished_at TEXT,
+  detail TEXT,
+  UNIQUE(sha, requested_by)
+);
+
+CREATE INDEX IF NOT EXISTS rollback_intents_pending
+  ON rollback_intents(status, requested_at);
+
+CREATE TABLE IF NOT EXISTS commit_analysis (
+  sha TEXT PRIMARY KEY,
+  deploy_sha TEXT NOT NULL,
+  baseline_sha TEXT,
+  author_login TEXT,
+  message TEXT,
+  category TEXT,
+  severity TEXT,
+  summary TEXT,
+  diff_blob TEXT,
+  created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS commit_analysis_deploy
+  ON commit_analysis(deploy_sha);

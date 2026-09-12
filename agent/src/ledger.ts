@@ -60,15 +60,46 @@ const getPred = db.prepare(`
    WHERE merged_sha = ? OR head_sha = ?
    ORDER BY id DESC LIMIT 1
 `);
+const getPredByPr = db.prepare(`
+  SELECT estimated_cost_delta_pct FROM predictions
+   WHERE pr_number = ?
+   ORDER BY id DESC LIMIT 1
+`);
 const getRevertFor = db.prepare(`SELECT sha FROM deploys WHERE reverts_sha = ? LIMIT 1`);
+
+export type EvalSnap = {
+  id: number;
+  sha: string;
+  baseline_sha: string | null;
+  verdict: string;
+  actual_cost_delta_pct: number | null;
+  actual_latency_delta_pct: number | null;
+  error_rate_delta: number | null;
+  predicted_cost_delta_pct: number | null;
+  prediction_error_pp: number | null;
+  summary: string | null;
+  cost_per_req: number | null;
+  latency_ms: number | null;
+  error_rate: number | null;
+  n: number | null;
+  doc_id: string | null;
+  created_at: string;
+};
+
+const getHistoryRows = db.prepare(`
+  SELECT * FROM evaluation_history WHERE sha = ? ORDER BY id ASC
+`);
+const setDocOnHistory = db.prepare(`UPDATE evaluation_history SET doc_id = ? WHERE id = ?`);
 const getActionFlags = db.prepare(`
-  SELECT rollback_executed, sheet_appended, doc_id FROM actions WHERE sha = ?
+  SELECT rollback_executed, sheet_appended, doc_id, outcome FROM actions WHERE sha = ?
 `);
 
 const TERMINAL = new Set(["rolled_back", "skipped_revert", "monitoring"]);
 
-function outcomeForStatus(status: string, rollbackExecuted: number): string {
-  if (rollbackExecuted) return "rollback";
+function outcomeForStatus(status: string, flags: { rollback_executed: number; outcome?: string | null } | undefined): string {
+  // A stored outcome (timeout vs keep, rollback) is more precise than status-derived.
+  if (flags?.outcome) return flags.outcome;
+  if (flags?.rollback_executed) return "rollback";
   if (status === "skipped_revert") return "skipped_revert";
   if (status === "rolled_back") return "rollback";
   if (status === "monitoring") return "keep";
@@ -77,7 +108,7 @@ function outcomeForStatus(status: string, rollbackExecuted: number): string {
   return status;
 }
 
-function factsForSha(sha: string, outcome: string): LedgerFacts {
+async function factsForSha(sha: string, outcome: string, snap?: EvalSnap): Promise<LedgerFacts> {
   const deploy = getDeploy.get(sha) as
     | {
         sha: string;
@@ -99,37 +130,114 @@ function factsForSha(sha: string, outcome: string): LedgerFacts {
         verdict: string;
       }
     | undefined;
-  const pr = getPr.get(sha, sha) as { number: number; author_login: string | null } | undefined;
-  const pred = getPred.get(sha, sha) as { estimated_cost_delta_pct: number | null } | undefined;
+  let pr = getPr.get(sha, sha) as { number: number; author_login: string | null } | undefined;
+  // Direct-push deploys have no PR on the deploy sha itself — look through the
+  // compare commits so a deploy of PR commits is linked to its PR.
+  if (!pr) {
+    const base = evaln?.baseline_sha ?? deploy?.previous_sha ?? null;
+    if (base) {
+      try {
+        const { githubCompare } = await import("./github.js");
+        const cmp = await githubCompare(base, sha);
+        for (const c of (cmp.commits ?? []).slice(0, 10)) {
+          const found = getPr.get(c.sha, c.sha) as { number: number; author_login: string | null } | undefined;
+          if (found) {
+            pr = found;
+            break;
+          }
+        }
+      } catch {
+        // no PR link — leave empty
+      }
+    }
+  }
+  const pred =
+    (getPred.get(sha, sha) as { estimated_cost_delta_pct: number | null } | undefined) ??
+    (pr ? (getPredByPr.get(pr.number) as { estimated_cost_delta_pct: number | null } | undefined) : undefined);
   const slice = summarizeTelemetry(sha);
   const skipped = deploy?.origin === "revert" || deploy?.status === "skipped_revert" || outcome.includes("skip");
-  const verdict = skipped ? "skipped_revert" : (evaln?.verdict ?? (outcome.includes("insufficient") ? "insufficient_data" : ""));
-  const predicted = evaln?.predicted_cost_delta_pct ?? pred?.estimated_cost_delta_pct ?? null;
+  const verdict = skipped ? "skipped_revert" : (snap?.verdict ?? evaln?.verdict ?? (outcome.includes("insufficient") ? "insufficient_data" : ""));
+  const predicted = snap?.predicted_cost_delta_pct ?? evaln?.predicted_cost_delta_pct ?? pred?.estimated_cost_delta_pct ?? null;
   const errorPp =
+    snap?.prediction_error_pp ??
     evaln?.prediction_error_pp ??
     (predicted != null && evaln?.actual_cost_delta_pct != null ? evaln.actual_cost_delta_pct - predicted : null);
   return {
     sha,
-    deployedAt: deploy?.deployed_at ?? null,
+    deployedAt: snap?.created_at ?? deploy?.deployed_at ?? null,
     pr: pr ? prHref(pr.number) : "",
     author: pr?.author_login ? `@${pr.author_login.replace(/^@/, "")}` : "",
     model: dominantModel(slice),
-    requests: slice.n || deploy?.request_count || 0,
-    costPerReq: skipped || !slice.n ? null : slice.cost_per_req,
-    deltaCost: skipped ? null : (evaln?.actual_cost_delta_pct ?? null),
+    requests: snap?.n ?? slice.n ?? deploy?.request_count ?? 0,
+    costPerReq: skipped || !slice.n ? null : (snap?.cost_per_req ?? slice.cost_per_req),
+    deltaCost: skipped ? null : (snap?.actual_cost_delta_pct ?? evaln?.actual_cost_delta_pct ?? null),
     p95: skipped || !slice.n ? null : (slice.latency_p95_ms ?? slice.latency_ms),
-    deltaLatency: skipped ? null : (evaln?.actual_latency_delta_pct ?? null),
-    errorRate: skipped || !slice.n ? null : slice.error_rate,
+    deltaLatency: skipped ? null : (snap?.actual_latency_delta_pct ?? evaln?.actual_latency_delta_pct ?? null),
+    errorRate: skipped || !slice.n ? null : (snap?.error_rate ?? slice.error_rate),
     verdict: verdict || ledgerOutcome(outcome),
     predicted: skipped ? null : predicted,
     errorPp: skipped ? null : errorPp,
     outcome: skipped ? "skipped_revert" : outcome,
-    baseline: evaln?.baseline_sha ?? deploy?.previous_sha ?? deploy?.reverts_sha ?? null,
+    baseline: snap?.baseline_sha ?? evaln?.baseline_sha ?? deploy?.previous_sha ?? deploy?.reverts_sha ?? null,
   };
 }
 
 function headerLooksRight(row: string[] | undefined): boolean {
   return (row?.[0] ?? "") === "Deploy" && (row?.[12] ?? "") === "Predicted";
+}
+
+// Every terminal deploy in chronological order — the ledger is always rebuilt
+// from this, so rows can never be appended out of order.
+async function ledgerGrid(): Promise<string[][]> {
+  const rows: string[][] = [LEDGER_HEADER];
+  const listed = allDeploys.all() as {
+    sha: string;
+    status: string;
+    origin: string;
+  }[];
+  for (const row of listed) {
+    if (row.origin === "revert" || row.status === "skipped_revert") {
+      rows.push(formatLedgerFacts(await factsForSha(row.sha, "skipped_revert")));
+      ensureAction.run(row.sha);
+      setSheet.run(row.sha);
+      continue;
+    }
+    if (!TERMINAL.has(row.status)) continue;
+    const flags = getActionFlags.get(row.sha) as { rollback_executed: number; outcome?: string | null } | undefined;
+    const outcome = outcomeForStatus(row.status, flags);
+    // One ledger row per evaluation — cost regression and error spike are
+    // decoupled, each with its own snapshot numbers.
+    const snaps = getHistoryRows.all(row.sha) as EvalSnap[];
+    if (snaps.length) {
+      for (const snap of snaps) {
+        rows.push(formatLedgerFacts(await factsForSha(row.sha, outcome, snap)));
+      }
+    } else {
+      rows.push(formatLedgerFacts(await factsForSha(row.sha, outcome)));
+    }
+    ensureAction.run(row.sha);
+    setSheet.run(row.sha);
+  }
+  return rows;
+}
+
+async function writeLedgerGrid(rows: string[][]) {
+  try {
+    await patchSheetCells(config.ambiguousSheetId, cellsForGrid(rows));
+    console.log(`ledger written ${rows.length - 1} rows`);
+  } catch (err) {
+    console.error("ledger write", err);
+    try {
+      await appendSheetValues(config.ambiguousSheetId, [LEDGER_HEADER], "A1");
+    } catch {
+      // ignore
+    }
+  }
+}
+
+export async function rebuildLedger() {
+  if (!config.ambiguousSheetId) return;
+  await writeLedgerGrid(await ledgerGrid());
 }
 
 export async function ensureLedgerSurface() {
@@ -146,45 +254,15 @@ export async function ensureLedgerSurface() {
     console.error("ledger read", err);
   }
   if (headerLooksRight(existing[0])) return;
-  const rows: string[][] = [LEDGER_HEADER];
-  const listed = allDeploys.all() as {
-    sha: string;
-    status: string;
-    origin: string;
-  }[];
-  for (const row of listed) {
-    if (row.origin === "revert" || row.status === "skipped_revert") {
-      rows.push(formatLedgerFacts(factsForSha(row.sha, "skipped_revert")));
-      ensureAction.run(row.sha);
-      setSheet.run(row.sha);
-      continue;
-    }
-    if (!TERMINAL.has(row.status)) continue;
-    const flags = getActionFlags.get(row.sha) as { rollback_executed: number } | undefined;
-    const outcome = outcomeForStatus(row.status, flags?.rollback_executed ?? 0);
-    rows.push(formatLedgerFacts(factsForSha(row.sha, outcome)));
-    ensureAction.run(row.sha);
-    setSheet.run(row.sha);
-  }
-  try {
-    await patchSheetCells(config.ambiguousSheetId, cellsForGrid(rows));
-    console.log(`ledger migrated ${rows.length - 1} rows`);
-  } catch (err) {
-    console.error("ledger migrate", err);
-    try {
-      await appendSheetValues(config.ambiguousSheetId, [LEDGER_HEADER], "A1");
-    } catch {
-      // ignore
-    }
-  }
+  await writeLedgerGrid(await ledgerGrid());
 }
 
 export async function refreshPostmortems() {
   const docs = db.prepare(`SELECT sha FROM actions WHERE doc_id IS NOT NULL`).all() as { sha: string }[];
   for (const { sha } of docs) {
-    const flags = getActionFlags.get(sha) as { rollback_executed: number } | undefined;
+    const flags = getActionFlags.get(sha) as { rollback_executed: number; outcome?: string | null } | undefined;
     const deploy = getDeploy.get(sha) as { status: string } | undefined;
-    const outcome = outcomeForStatus(deploy?.status ?? "", flags?.rollback_executed ?? 0);
+    const outcome = outcomeForStatus(deploy?.status ?? "", flags);
     const sha7 = sha.slice(0, 7);
     try {
       console.log(`postmortem refresh ${sha7}`);
@@ -219,13 +297,8 @@ export async function appendLedgerRow(sha: string, outcome: string) {
   await ensureLedgerSurface();
   const already = getAction.get(sha) as { sheet_appended: number } | undefined;
   if (already?.sheet_appended) return;
-  const values = [formatLedgerFacts(factsForSha(sha, outcome))];
-  try {
-    await appendSheetValues(config.ambiguousSheetId, values, "A1");
-    setSheet.run(sha);
-  } catch (err) {
-    console.error(`ledger append ${sha.slice(0, 7)}`, err);
-  }
+  setSheet.run(sha);
+  await writeLedgerGrid(await ledgerGrid());
 }
 
 export async function writePostmortem(
@@ -251,33 +324,77 @@ export async function writePostmortem(
   const resolvedAt = extras.resolvedAt ?? existing?.resolved_at ?? nowIso;
   setResolvedAt.run(resolvedAt, sha);
   const revertRow = getRevertFor.get(sha) as { sha: string } | undefined;
-  const markdown = formatPostmortem({
-    ...input,
-    outcome,
-    revertSha: extras.revertSha ?? revertRow?.sha ?? input.revertSha ?? null,
-    resolvedAt,
-  });
-  const title = postmortemTitle({
-    sha,
-    verdict: input.verdict,
-    deployedAt: input.deployedAt,
-    outcome,
-  });
-  const hash = createHash("sha1").update(markdown).digest("hex");
-  if (existing?.doc_id) {
-    if (existing.doc_hash === hash && existing.doc_title === title) {
-      return existing.doc_id;
+
+  // One postmortem doc PER EVALUATION — cost regression and error spike are
+  // decoupled, each with its own snapshot numbers and title.
+  const snaps = getHistoryRows.all(sha) as EvalSnap[];
+  if (!snaps.length) {
+    snaps.push({
+      id: -1,
+      sha,
+      baseline_sha: input.baseline_sha ?? null,
+      verdict: input.verdict,
+      actual_cost_delta_pct: input.actual_cost_delta_pct,
+      actual_latency_delta_pct: input.actual_latency_delta_pct,
+      error_rate_delta: null,
+      predicted_cost_delta_pct: input.predicted_cost_delta_pct,
+      prediction_error_pp: input.predictionErrorPp ?? null,
+      summary: null,
+      cost_per_req: input.current.cost_per_req,
+      latency_ms: input.current.latency_ms,
+      error_rate: input.current.error_rate,
+      n: input.current.n,
+      doc_id: existing?.doc_id ?? null,
+      created_at: input.deployedAt ?? nowIso,
+    });
+  }
+  let latestDoc: string | null = null;
+  for (const snap of snaps) {
+    const docInput = {
+      ...input,
+      verdict: snap.verdict,
+      baseline_sha: snap.baseline_sha ?? undefined,
+      actual_cost_delta_pct: snap.actual_cost_delta_pct ?? 0,
+      actual_latency_delta_pct: snap.actual_latency_delta_pct ?? 0,
+      predicted_cost_delta_pct: snap.predicted_cost_delta_pct,
+      predictionErrorPp: snap.prediction_error_pp ?? null,
+      deployedAt: snap.created_at,
+      current: {
+        ...input.current,
+        n: snap.n ?? input.current.n,
+        cost_per_req: snap.cost_per_req ?? input.current.cost_per_req,
+        latency_ms: snap.latency_ms ?? input.current.latency_ms,
+        error_rate: snap.error_rate ?? input.current.error_rate,
+      },
+    };
+    const markdown = formatPostmortem({
+      ...docInput,
+      outcome,
+      revertSha: extras.revertSha ?? revertRow?.sha ?? input.revertSha ?? null,
+      resolvedAt,
+    });
+    const title = postmortemTitle({ sha, verdict: snap.verdict, deployedAt: snap.created_at });
+    const docId =
+      snap.doc_id ?? (snap.verdict === input.verdict ? existing?.doc_id ?? null : null);
+    if (docId) {
+      try {
+        await updateDocument(docId, markdown, title);
+        if (snap.id >= 0) setDocOnHistory.run(docId, snap.id);
+        latestDoc = docId;
+      } catch (err) {
+        console.error(`postmortem update ${sha7}`, err);
+      }
+      continue;
     }
     try {
-      await updateDocument(existing.doc_id, markdown, title);
-      setDocMeta.run(hash, title, sha);
-      return existing.doc_id;
+      const doc = await createDocument(title, markdown);
+      if (snap.id >= 0) setDocOnHistory.run(doc.id, snap.id);
+      latestDoc = doc.id;
     } catch (err) {
-      console.error(`postmortem update ${sha7}`, err);
+      console.error(`postmortem create ${sha7}`, err);
     }
   }
-  const doc = await createDocument(title, markdown);
-  setDoc.run(doc.id, sha);
-  setDocMeta.run(hash, title, sha);
-  return doc.id;
+  if (latestDoc) setDoc.run(latestDoc, sha);
+  return latestDoc ?? existing?.doc_id ?? null;
 }
+

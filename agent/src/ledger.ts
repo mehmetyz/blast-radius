@@ -211,7 +211,7 @@ async function ledgerGrid(): Promise<string[][]> {
     const snaps = getHistoryRows.all(row.sha) as EvalSnap[];
     if (snaps.length) {
       const intent = db
-        .prepare(`SELECT filter, chosen_sha FROM rollback_intents WHERE sha = ? AND status = 'done' ORDER BY id DESC LIMIT 1`)
+        .prepare(`SELECT filter, chosen_sha FROM rollback_intents WHERE sha = ? ORDER BY id DESC LIMIT 1`)
         .get(row.sha) as { filter: string | null; chosen_sha: string | null } | undefined;
       for (const snap of snaps) {
         const analysis = db

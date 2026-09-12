@@ -1129,9 +1129,10 @@ export function decisionLine(outcome: string, sha7: string, input?: CopyInput): 
       input.baseline_sha != null &&
       input.rollbackTarget !== input.baseline_sha;
     if (surgical) {
+      const back = shortSha(input.rollbackChosen ?? input.rollbackTarget ?? sha7);
       return input.rollbackResolved
-        ? `↩️ Rolled back to just before \`${shortSha(input!.rollbackTarget!)}\` — this regression is resolved.`
-        : `↩️ Rolled back to just before \`${shortSha(input!.rollbackTarget!)}\` — the reverted commit's change is gone; the rest of the deploy is still live.`;
+        ? `↩️ Rolled back to just before \`${back}\` — this regression is resolved.`
+        : `↩️ Rolled back to just before \`${back}\` — the reverted commit's change is gone; the rest of the deploy is still live.`;
     }
     return `↩️ Rolled back \`${sha7}\` → ${prev}. The revert itself is not evaluated.`;
   }

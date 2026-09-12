@@ -324,7 +324,7 @@ export async function appendLedgerRow(sha: string, outcome: string) {
   await writeLedgerGrid(await ledgerGrid());
 }
 
-function rollbackResolvesVerdict(
+export function rollbackResolvesVerdict(
   input: { commitAnalysis?: { sha: string; category: string }[]; baseline_sha?: string },
   verdict: string,
   chosenSha: string | null,

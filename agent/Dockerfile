@@ -1,5 +1,7 @@
 # ---- build stage: compile TypeScript, audit dependencies ----
-FROM node:22-slim AS build
+# Pinned by digest to node 22.23.2-slim (Debian bookworm) — the latest patched
+# 22.x release at build time. Bump the digest to update the base deliberately.
+FROM node@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5 AS build
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci
@@ -9,7 +11,7 @@ COPY src ./src
 RUN npm run compile && cp src/schema.sql dist/schema.sql
 
 # ---- runtime stage: minimal, non-root, no secrets ----
-FROM node:22-slim
+FROM node@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5
 ENV NODE_ENV=production
 ENV PORT=3001
 ENV DATABASE_PATH=/data/blast-radius.db

@@ -4,6 +4,7 @@ import { evaluateDeploy } from "./evaluator.js";
 import { getPull, githubCompare, pullsForCommit, type LinkedPr } from "./github.js";
 import {
   formatRegressionAlert,
+  parsePatch,
   type CopyChange,
   type CopyCommit,
   type CopyInput,
@@ -30,6 +31,7 @@ const fixFor = db.prepare(
 const deployFor = db.prepare(
   `SELECT previous_sha, deployed_at, github_compare_url FROM deploys WHERE sha = ?`,
 );
+const awaitingFor = db.prepare(`SELECT awaiting_at FROM actions WHERE sha = ?`);
 
 export async function loadAlertContext(sha: string, note?: string): Promise<CopyInput | null> {
   const evaln = evaluateDeploy(sha);
@@ -63,15 +65,20 @@ export async function loadAlertContext(sha: string, note?: string): Promise<Copy
       if (row.author_login) authors.add(row.author_login);
     }
   }
+  let errorRiskFlags: string[] = [];
   try {
-    const hints = pred?.suspect_hints ? (JSON.parse(pred.suspect_hints) as { authors?: string[] }) : null;
+    const hints = pred?.suspect_hints
+      ? (JSON.parse(pred.suspect_hints) as { authors?: string[]; error_risks?: string[] })
+      : null;
     for (const a of hints?.authors ?? []) authors.add(a);
+    errorRiskFlags = (hints?.error_risks ?? []).map((s) => String(s)).filter(Boolean);
   } catch {
     // ignore bad JSON
   }
 
   let commits: CopyCommit[] = [];
   let files: string[] = [];
+  let patches: CopyInput["patches"] = [];
   let compareUrl: string | null = deploy?.github_compare_url ?? null;
   const changesByNumber = new Map<number, CopyChange>();
 
@@ -85,6 +92,7 @@ export async function loadAlertContext(sha: string, note?: string): Promise<Copy
         author: c.author?.login ?? c.commit.author.name,
       }));
       files = (cmp.files ?? []).map((f) => f.filename);
+      patches = (cmp.files ?? []).map((f) => parsePatch(f.filename, f.patch));
       for (const c of commits) if (c.author) authors.add(c.author);
     } catch (err) {
       console.error(`compare ${sha.slice(0, 7)}`, err);
@@ -124,6 +132,8 @@ export async function loadAlertContext(sha: string, note?: string): Promise<Copy
     .hottest_span;
   const newSpans = (evaln as { new_spans?: { kind: string; name: string }[] }).new_spans ?? [];
 
+  const awaiting = awaitingFor.get(sha) as { awaiting_at: string | null } | undefined;
+
   return {
     sha: evaln.sha,
     baseline_sha: evaln.baseline_sha,
@@ -145,9 +155,13 @@ export async function loadAlertContext(sha: string, note?: string): Promise<Copy
     commits,
     changes: [...changesByNumber.values()],
     files,
+    patches,
     compareUrl,
     deployedAt: deploy?.deployed_at ?? null,
     previousSha: deploy?.previous_sha ?? evaln.baseline_sha ?? null,
+    awaitingAt: awaiting?.awaiting_at ?? null,
+    predictionErrorPp: evaln.prediction_error_pp ?? null,
+    errorRiskFlags,
   };
 }
 

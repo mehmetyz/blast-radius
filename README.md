@@ -2,6 +2,8 @@
 
 An AI agent that owns a bad LLM deploy: estimate impact on the PR, verify that estimate after deploy, alert in Ambiguous, wait for a human, then rollback.
 
+It watches **LLM cost**, **LLM latency**, **HTTP/endpoint latency** (non-LLM spans), and **error rate**. Rollback is never automatic.
+
 See [SPEC.md](SPEC.md) and [TASKS.md](TASKS.md).
 
 ## Run

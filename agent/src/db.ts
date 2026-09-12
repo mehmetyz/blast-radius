@@ -18,8 +18,18 @@ export const db = (() => {
   if (!names.has("kind")) instance.exec(`ALTER TABLE telemetry ADD COLUMN kind TEXT NOT NULL DEFAULT 'llm'`);
   if (!names.has("name")) instance.exec(`ALTER TABLE telemetry ADD COLUMN name TEXT`);
   const actionCols = instance.prepare(`PRAGMA table_info(actions)`).all() as { name: string }[];
-  if (!actionCols.some((c) => c.name === "awaiting_at")) {
+  const actionColNames = new Set(actionCols.map((c) => c.name));
+  if (!actionColNames.has("awaiting_at")) {
     instance.exec(`ALTER TABLE actions ADD COLUMN awaiting_at TEXT`);
+  }
+  if (!actionColNames.has("doc_hash")) {
+    instance.exec(`ALTER TABLE actions ADD COLUMN doc_hash TEXT`);
+  }
+  if (!actionColNames.has("doc_title")) {
+    instance.exec(`ALTER TABLE actions ADD COLUMN doc_title TEXT`);
+  }
+  if (!actionColNames.has("resolved_at")) {
+    instance.exec(`ALTER TABLE actions ADD COLUMN resolved_at TEXT`);
   }
   return instance;
 })();

@@ -38,7 +38,7 @@ export async function executeRollback(
     setRollback.run(sha);
     setStatus.run("rolled_back", sha);
     try {
-      await writePostmortem(sha, `rolled back to ${deploy.previous_sha.slice(0, 7)}`);
+      await writePostmortem(sha, "rollback", { revertSha });
     } catch (err) {
       console.error(`postmortem ${sha7}`, err);
     }

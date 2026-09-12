@@ -1,6 +1,6 @@
 import { config } from "./config.js";
 import { db } from "./db.js";
-import { createTask, listMessages } from "./ambiguous.js";
+import { createTask, listMessages, postMessage } from "./ambiguous.js";
 import { deliverySeen, markDelivery } from "./deploys.js";
 import { executeRollback, followUp } from "./rollback.js";
 import { appendLedgerRow, writePostmortem } from "./ledger.js";
@@ -28,8 +28,6 @@ export async function openApproval(sha: string) {
 
 export async function watchApprovals() {
   const open = awaiting.all() as { sha: string; awaiting_at: string | null }[];
-  if (!open.length) return;
-
   const msgs = await listMessages(80);
   for (const msg of msgs) {
     if (msg.deleted_at || deliverySeen(msg.id)) continue;
@@ -37,8 +35,24 @@ export async function watchApprovals() {
     if (!parsed) continue;
     if (parsed.op === "active" || parsed.op === "insight" || parsed.op === "rootcause") continue;
 
+    if (!parsed.extra) continue;
     const hit = open.find((row) => matchesSha(parsed.extra, row.sha));
-    if (!hit) continue;
+    if (!hit) {
+      if (parsed.op === "rollback" || parsed.op === "keep" || parsed.op === "watch") {
+        markDelivery(msg.id, "ambiguous");
+        try {
+          const openList = open.map((r) => `\`${r.sha.slice(0, 7)}\``).join(", ") || "none";
+          await postMessage(
+            `Can't \`${parsed.op} ${parsed.extra}\` — no deploy is awaiting approval for that SHA. Currently awaiting: ${openList}.`,
+            null,
+            false,
+          );
+        } catch (err) {
+          console.error(`unknown-sha reply ${parsed.extra}`, err);
+        }
+      }
+      continue;
+    }
     markDelivery(msg.id, "ambiguous");
     try {
       await handleCommand(hit.sha, parsed.op, parsed.extra);

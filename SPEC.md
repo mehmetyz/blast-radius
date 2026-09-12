@@ -4,7 +4,7 @@ AI agent that **owns** a bad LLM deploy: estimate impact on the PR, verify that 
 
 Heart of the product: **INSIGHT prediction is scored against ACTIVE telemetry.** Example: `predicted +240% cost, actual +238%`. Without INSIGHT there is no bridge.
 
-INSIGHT is not LLM-cost-only. A PR that adds an endpoint or a hot function is estimated too (latency / error risk). ACTIVE verifies those estimates with live spans. ROOT CAUSE runs when production errors spike: which SHA they started after, the cause, a fix, and **every** author on that change.
+INSIGHT cost is **deterministic** (price table in `agent/src/pricing.ts`: model swap, completion-call count, `max_tokens`). The LLM does not invent that percentage. Latency is an explicit estimate. Endpoint/error issues are qualitative flags with no numbers. ACTIVE verifies those estimates with live **LLM and HTTP/function** spans. ROOT CAUSE runs when production errors spike: which SHA they started after, `file:line` + author, a fix, and a **ranked suspect list** (never one culprit).
 
 ## Stack
 
@@ -107,7 +107,7 @@ Rules:
 
 ## Agent tools
 
-INSIGHT does **not** use this list (one LLM call + `comment_on_pr`). ACTIVE and ROOT CAUSE do.
+INSIGHT: deterministic cost from `pricing.ts` + one LLM call for latency estimate and qualitative risks + `comment_on_pr`. Channel message only if cost/latency crosses the regression threshold or an error risk is flagged. ACTIVE and ROOT CAUSE use the tool list below.
 
 - `get_deploy_context(sha: string)` → deploy, baseline, linked PRs, predictions
 - `summarize_telemetry(sha: string)` → n, cost_usd, p50/p95 latency, error_rate, by_model
@@ -115,7 +115,7 @@ INSIGHT does **not** use this list (one LLM call + `comment_on_pr`). ACTIVE and 
 - `github_compare(base: string, head: string)` → commits, files, PRs, authors
 - `post_message(content: string, thread_key: string, starts_new_block?: boolean)` → Ambiguous chat (`thread_key` = deploy SHA). Follow-ups use `thread_id` of that thread.
 - Channel commands (human, not LLM tools): `/blast-radius rollback {sha}`, `/blast-radius keep {sha}`, `/blast-radius status {sha}`. Agent posts use the same shape for actions; chat copy is human-readable.
-- Sheet title: `Blast Radius Ledger`. Docs: `Post Mortem - {D Mon YYYY HH:MM:SS}`.
+- Sheet title: `Blast Radius — Deploy Ledger`. Docs: `Postmortem — {sha7} · {verdict} · {YYYY-MM-DD}`.
 - `execute_rollback(sha: string)` — **hard-gated in code** on a matching `/blast-radius rollback {sha}` command in the channel; the model cannot bypass it; writes `pending_reverts`
 
 Ambiguous client (not tools): base `https://app.ambiguous.ai`, headers `Authorization: Bearer <key>` + `API-Version: 1`. Endpoints as in the kickoff (sheet `id` top-level; range query param is `spec`).
@@ -164,7 +164,7 @@ sequenceDiagram
 2. `POST /ingest` — auth via `INGEST_TOKEN`. Persist telemetry, bump `request_count`. Traffic source: demo app via `seed-traffic.js`.
 3. Worker loop — ignore `origin=revert`. If `collecting` and `request_count >= 20`, evaluate. Else if superseded and still `< 20` → `insufficient_data` (no alert).
 4. Evaluator writes `evaluations` including predicted-vs-actual. If verdict ≠ `ok`, run agent loop. Alert idempotency: `actions.sha` UNIQUE + Ambiguous `thread_key=sha`.
-5. Ranked **suspect list** (never one culprit). Alert lists **every** author on the compare, not a single owner.
+5. Ranked **suspect list** (never one culprit). Alert lists every ranked suspect with confidence; it does not name a single owner. Error spike alerts include `file:line` and the commit author.
 6. Human types `/blast-radius rollback {sha}` or `/blast-radius keep {sha}` in the same thread. Rollback is never automatic. No command before `COMMAND_MINUTES` → keep + Task.
 7. Failure handling lives in the core path (A1–A3), not in a later optional stage. README must list these scenarios (jury reads README, not the source tree).
 

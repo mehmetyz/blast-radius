@@ -1,17 +1,31 @@
 import { config } from "./config.js";
 import { cmd } from "./cmd.js";
 
-export const LEDGER_TITLE = "Blast Radius Ledger";
-export const LEDGER_TITLES = [LEDGER_TITLE, "Blast Radius ledger", "/blast-radius ledger"];
+export const LEDGER_TITLE = "Blast Radius — Deploy Ledger";
+export const LEDGER_TITLES = [
+  LEDGER_TITLE,
+  "Blast Radius Ledger",
+  "Blast Radius ledger",
+  "/blast-radius ledger",
+];
 
 export const LEDGER_HEADER = [
-  "When",
-  "SHA",
-  "What happened",
-  "Predicted vs live",
-  "Who",
-  "Action",
-  "Doc",
+  "Deploy",
+  "Time",
+  "PR",
+  "Author",
+  "Model",
+  "Requests",
+  "Cost/req",
+  "Δ Cost",
+  "P95 latency",
+  "Δ Latency",
+  "Error rate",
+  "Verdict",
+  "Predicted",
+  "Error (pp)",
+  "Outcome",
+  "Baseline",
 ];
 
 export type CopySlice = {
@@ -20,11 +34,50 @@ export type CopySlice = {
   cost_usd: number;
   cost_per_req: number;
   latency_ms: number;
+  latency_p95_ms?: number | null;
   error_rate: number;
   latency_kind?: string;
   by_name?: { kind: string; name: string; n: number; latency: number }[];
   by_model?: { model?: string; n?: number; cost?: number }[];
 };
+
+export type CopyPatch = {
+  filename: string;
+  line?: number;
+  added?: string;
+  rawPatch?: string;
+};
+
+export function parsePatch(filename: string, patch?: string): CopyPatch {
+  if (!patch) return { filename };
+  let newLine = 0;
+  let firstAdded: { line: number; text: string } | undefined;
+  for (const line of patch.split("\n")) {
+    const hunk = /^@@ -\d+(?:,\d+)? \+(\d+)/.exec(line);
+    if (hunk) {
+      newLine = Number(hunk[1]);
+      continue;
+    }
+    if (line.startsWith("+++") || line.startsWith("---")) continue;
+    if (line.startsWith("+") && !firstAdded) {
+      firstAdded = { line: newLine, text: line.slice(1).trim() };
+    }
+    if (line.startsWith("-")) continue;
+    newLine += 1;
+  }
+  return {
+    filename,
+    line: firstAdded?.line,
+    added: firstAdded?.text,
+    rawPatch: patch,
+  };
+}
+
+export function trimDiff(patch: string, maxLines = 20): string {
+  const lines = patch.split("\n").filter((l) => !l.startsWith("@@"));
+  if (lines.length <= maxLines) return lines.join("\n").trim();
+  return lines.slice(0, maxLines).join("\n").trim() + `\n... (${lines.length - maxLines} more lines)`;
+}
 
 export type CopySuspect = {
   rank: number;
@@ -68,12 +121,18 @@ export type CopyInput = {
   hottestSpan?: { kind: string; name: string; latency_delta_pct: number } | null;
   newSpans?: { kind: string; name: string }[];
   outcome?: string;
+  errorRiskFlags?: string[];
   commits?: CopyCommit[];
   changes?: CopyChange[];
   files?: string[];
+  patches?: CopyPatch[];
   compareUrl?: string | null;
   deployedAt?: string | null;
   previousSha?: string | null;
+  awaitingAt?: string | null;
+  resolvedAt?: string | null;
+  revertSha?: string | null;
+  predictionErrorPp?: number | null;
 };
 
 export function shortSha(sha: string): string {
@@ -103,12 +162,6 @@ export function errPct(n: number): string {
   return `${(n * 100).toFixed(n >= 0.01 ? 1 : 0)}%`;
 }
 
-const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-
-function pad(n: number): string {
-  return String(n).padStart(2, "0");
-}
-
 function asDate(input?: string | Date | null): Date {
   if (input instanceof Date) return input;
   if (input) {
@@ -119,13 +172,36 @@ function asDate(input?: string | Date | null): Date {
 }
 
 export function whenStamp(d?: string | Date | null): string {
-  const t = asDate(d);
-  return `${t.getDate()} ${MONTHS[t.getMonth()]} ${pad(t.getHours())}:${pad(t.getMinutes())}:${pad(t.getSeconds())}`;
+  return utcStamp(d, false);
 }
 
-export function postmortemTitle(d?: string | Date | null): string {
-  const t = asDate(d);
-  return `Post Mortem - ${t.getDate()} ${MONTHS[t.getMonth()]} ${t.getFullYear()} ${pad(t.getHours())}:${pad(t.getMinutes())}:${pad(t.getSeconds())}`;
+export function utcStamp(d?: string | Date | null, seconds = false): string {
+  const iso = asDate(d).toISOString();
+  return seconds ? iso.slice(0, 19).replace("T", " ") : iso.slice(0, 16).replace("T", " ");
+}
+
+export function utcDate(d?: string | Date | null): string {
+  return asDate(d).toISOString().slice(0, 10);
+}
+
+export function verdictSlug(verdict: string): string {
+  if (verdict === "error_spike") return "error spike";
+  if (verdict === "latency_regression") return "latency regression";
+  if (verdict === "cost_regression") return "cost regression";
+  if (verdict === "skipped_revert") return "skipped revert";
+  if (verdict === "insufficient_data") return "insufficient data";
+  return verdict.replace(/_/g, " ");
+}
+
+export function postmortemTitle(input: {
+  sha: string;
+  verdict?: string;
+  deployedAt?: string | Date | null;
+  outcome?: string;
+}): string {
+  const sha7 = shortSha(input.sha);
+  const verdict = verdictSlug(input.verdict || input.outcome || "deploy");
+  return `Postmortem — ${sha7} · ${verdict} · ${utcDate(input.deployedAt)}`;
 }
 
 function ratio(now: number, then: number): number | null {
@@ -152,13 +228,6 @@ function fileFrom(reason: string): string | null {
   return file?.[0] ?? null;
 }
 
-function confWords(n: number): string {
-  const c = n <= 1 ? n * 100 : n;
-  if (c >= 70) return "high confidence";
-  if (c >= 40) return "medium confidence";
-  return "low confidence";
-}
-
 function collapseSuspects(suspects: CopySuspect[]): CopySuspect[] {
   const byKey = new Map<string, CopySuspect>();
   const score = (s: CopySuspect) => {
@@ -177,7 +246,12 @@ function collapseSuspects(suspects: CopySuspect[]): CopySuspect[] {
 function prLink(n: number, title?: string): string {
   const label = title ? `#${n} ${title}` : `#${n}`;
   if (!config.githubRepo) return label;
-  return `[${label}](https://github.com/${config.githubRepo}/pull/${n})`;
+  return `[${label}](${prHref(n)})`;
+}
+
+export function prHref(n: number): string {
+  if (!config.githubRepo) return `#${n}`;
+  return `https://github.com/${config.githubRepo}/pull/${n}`;
 }
 
 function at(login?: string | null): string {
@@ -213,12 +287,6 @@ export function verdictLabel(verdict: string): string {
   if (verdict === "latency_regression") return "Latency regression";
   if (verdict === "cost_regression") return "Cost regression";
   return verdict.replace(/_/g, " ");
-}
-
-function verdictMark(verdict: string): string {
-  if (verdict === "error_spike") return "🚨";
-  if (verdict === "latency_regression") return "🟡";
-  return "🔴";
 }
 
 export function whatHappened(input: Pick<
@@ -276,128 +344,111 @@ function tidy(lines: string[]): string {
     .trim()}\n`;
 }
 
-function headline(input: CopyInput): string {
-  const sha7 = shortSha(input.sha);
-  const change = primaryChange(input);
-  const pr = change ? ` · ${prLink(change.pr_number)}` : "";
-  return `${verdictMark(input.verdict)} **${verdictLabel(input.verdict)}** · \`${sha7}\`${pr}`;
+export function alertMark(verdict: string): string {
+  if (verdict === "error_spike") return "🚨";
+  if (verdict === "latency_regression") return "🟡";
+  return "🔴";
 }
 
-function moneyLine(input: CopyInput): string {
+function alertImpactLines(input: CopyInput): string[] {
+  const n = input.current.n;
+  const base7 = input.baseline_sha ? `\`${shortSha(input.baseline_sha)}\`` : "the last release";
   if (input.verdict === "error_spike") {
-    return `**${errPct(input.baseline.error_rate)} → ${errPct(input.current.error_rate)} errors**`;
+    const failed = Math.round(input.current.error_rate * n);
+    const costDrop = pct(input.actual_cost_delta_pct);
+    const latDrop = pct(input.actual_latency_delta_pct);
+    return [
+      `**Errors ${errPct(input.baseline.error_rate)} → ${errPct(input.current.error_rate)}** (${failed} of ${n} requests failed)`,
+      `Cost **${costDrop}** · latency **${latDrop}** · baseline ${base7}`,
+      "",
+      "Failed requests short-circuit before reaching the LLM — that's why cost and latency dropped.",
+    ];
   }
   if (input.verdict === "latency_regression") {
-    return `**${ms(input.baseline.latency_ms)} → ${ms(input.current.latency_ms)}** (${pct(input.actual_latency_delta_pct)})`;
+    return [
+      `**${ms(input.baseline.latency_ms)} → ${ms(input.current.latency_ms)} per request** (${pct(input.actual_latency_delta_pct)})`,
+      `Cost ${pct(input.actual_cost_delta_pct)} · errors ${errPct(input.current.error_rate)} · ${n} requests · baseline ${base7}`,
+    ];
   }
   const r = ratio(input.current.cost_per_req, input.baseline.cost_per_req);
-  const extra = r && r >= 1.2 ? ` (${ratioLabel(r)})` : ` (${pct(input.actual_cost_delta_pct)})`;
-  return `**${usd(input.baseline.cost_per_req)} → ${usd(input.current.cost_per_req)} per request**${extra}`;
-}
-
-function predictedParagraph(input: CopyInput): string[] {
-  if (input.verdict === "error_spike") return [];
-  const lines: string[] = [];
-  if (input.predicted_cost_delta_pct != null) {
-    const miss = Math.abs(input.actual_cost_delta_pct - input.predicted_cost_delta_pct);
-    const close = miss <= 20 ? " Close." : "";
-    lines.push(
-      `I predicted ${pct(input.predicted_cost_delta_pct)} cost on the PR. Actual: ${pct(input.actual_cost_delta_pct)}.${close}`,
-    );
-  }
-  if (input.predicted_latency_delta_pct != null) {
-    const faster = input.actual_latency_delta_pct < 0 ? " (faster)" : "";
-    lines.push(
-      `I predicted ${pct(input.predicted_latency_delta_pct)} latency. Actual: ${pct(input.actual_latency_delta_pct)}${faster}.`,
-    );
-  }
-  return lines;
-}
-
-function causeBlock(input: CopyInput): string[] {
-  const change = primaryChange(input);
-  const commit = primaryCommit(input);
-  const suspects = collapseSuspects(input.suspects);
-  const top = suspects[0];
-  const file = top ? fileFrom(top.reason) : input.files?.[0];
-  const model = modelShift(input);
-  const lines: string[] = ["**Most likely cause**"];
-  if (file) lines.push(`\`${file}\`${model ? ` — model ${model}` : ""}`);
-  else if (model) lines.push(`Model ${model}`);
-  if (change) {
-    const branch =
-      change.head && change.base ? ` \`${change.head}\` → \`${change.base}\`` : change.head ? ` \`${change.head}\`` : "";
-    lines.push(`${prLink(change.pr_number, change.title)} by ${at(change.author)}${branch}`);
-  }
-  if (commit) lines.push(`\`${shortSha(commit.sha)}\` ${subject(commit.message)}`);
-  if (input.rootCause) lines.push(sentence(input.rootCause));
-  if (input.fix) lines.push(`Fix: ${sentence(input.fix)}`);
-  if (lines.length === 1) {
-    const people = whoCompact(input);
-    if (people) lines.push(people);
-  }
-  return lines;
-}
-
-function otherDetails(input: CopyInput): string[] {
-  const change = primaryChange(input);
-  const primarySha = primaryCommit(input)?.sha;
-  const extraCommits = (input.commits ?? []).filter((c) => c.sha !== primarySha);
-  const extraChanges = (input.changes ?? []).filter((c) => c.pr_number !== change?.pr_number);
-  const extraSuspects = collapseSuspects(input.suspects).slice(1);
-  if (!extraCommits.length && !extraChanges.length && !extraSuspects.length) return [];
-
-  const items: string[] = [];
-  for (const c of extraChanges) {
-    items.push(
-      `- ${prLink(c.pr_number, c.title)} by ${at(c.author)}${c.head ? ` (\`${c.head}\`)` : ""}`,
-    );
-  }
-  for (const s of extraSuspects) {
-    const file = fileFrom(s.reason);
-    const pr = s.pr_number != null ? `#${s.pr_number}` : "";
-    items.push(`- ${[pr, at(s.author_login), file ? `\`${file}\`` : "", `(${confWords(s.confidence)})`].filter(Boolean).join(" ")}`);
-  }
-  for (const c of extraCommits.slice(0, 8)) {
-    items.push(`- \`${shortSha(c.sha)}\` ${subject(c.message)} — ${at(c.author)}`);
-  }
-  if (!items.length) return [];
+  const mult = r && r >= 1.2 ? ` (${ratioLabel(r)} more expensive)` : ` (${pct(input.actual_cost_delta_pct)})`;
   return [
-    "<details>",
-    "<summary>Other changes in this deploy</summary>",
-    "",
-    ...items,
-    "",
-    "</details>",
+    `**${usd(input.baseline.cost_per_req)} → ${usd(input.current.cost_per_req)} per request**${mult}`,
+    `Latency **${pct(input.actual_latency_delta_pct)}** · errors ${errPct(input.current.error_rate)} · ${n} requests · baseline ${base7}`,
   ];
 }
 
-function trafficFooter(input: CopyInput): string {
-  const base7 = input.baseline_sha ? `\`${shortSha(input.baseline_sha)}\`` : "the last release";
-  const n = input.current.n;
-  return `Based on ${n} request${n === 1 ? "" : "s"} since deploy · baseline ${base7}`;
+function changesBlock(input: CopyInput): string[] {
+  const patch = pickPatch(input);
+  if (!patch) return [];
+  const lines: string[] = [`**Changes** — \`${patch.filename}\``];
+  if (patch.rawPatch) {
+    lines.push("```diff", trimDiff(patch.rawPatch, 18), "```");
+  } else if (patch.added) {
+    lines.push("```diff", `+ ${patch.added.slice(0, 200)}`, "```");
+  }
+  const morePatches = (input.patches ?? []).filter((p) => p !== patch && (p.added || p.rawPatch));
+  if (morePatches.length) {
+    const summary = morePatches
+      .slice(0, 3)
+      .map((p) => {
+        const loc = p.line != null ? `${p.filename}:${p.line}` : p.filename;
+        const snippet = p.added ? ` — \`${p.added.slice(0, 80)}\`` : "";
+        return `\`${loc}\`${snippet}`;
+      })
+      .join("; ");
+    lines.push(`Also changed: ${summary}.`);
+  }
+  return lines;
 }
 
-function actionCommands(sha: string): string[] {
+function suspectsBlock(input: CopyInput): string[] {
+  const change = primaryChange(input);
+  const commit = primaryCommit(input);
+  const lines: string[] = ["**Suspects**", ""];
+  if (change) {
+    const author = at(change.author);
+    const commitBit = commit ? ` · commit \`${shortSha(commit.sha)}\`` : "";
+    lines.push(`**${prLink(change.pr_number, change.title)}** by ${author}${commitBit}`);
+    if (commit?.message) lines.push(`> ${subject(commit.message)}`);
+  } else if (commit) {
+    lines.push(`Commit \`${shortSha(commit.sha)}\` by ${at(commit.author)}`);
+    if (commit.message) lines.push(`> ${subject(commit.message)}`);
+  } else {
+    const people = whoCompact(input);
+    lines.push(people || "No PR or commit yet — compare still loading.");
+  }
+  const chg = changesBlock(input);
+  if (chg.length) {
+    lines.push("");
+    lines.push(...chg);
+  }
+  return lines;
+}
+
+function awaitingHumanBlock(sha: string, previousSha?: string | null): string[] {
   const sha7 = shortSha(sha);
-  return [cmd("rollback", sha7), cmd("keep", sha7)];
+  const prev = previousSha ? `\`${shortSha(previousSha)}\`` : "the previous release";
+  return [
+    "**Reply in this channel:**",
+    `- \`${cmd("rollback", sha7)}\` — revert to ${prev}`,
+    `- \`${cmd("keep", sha7)}\` — accept and keep watching`,
+    `- \`${cmd("status", sha7)}\` — fresh numbers`,
+    "",
+    "Nothing rolls back until you say so.",
+  ];
 }
 
 export function formatRegressionAlert(input: CopyInput): string {
+  const sha7 = shortSha(input.sha);
   const lines = [
-    headline(input),
+    `${alertMark(input.verdict)} **${verdictLabel(input.verdict)}** · \`${sha7}\``,
     "",
-    moneyLine(input),
-    ...predictedParagraph(input),
-    input.note ? sentence(input.note) : "",
+    ...alertImpactLines(input),
     "",
-    ...causeBlock(input),
+    ...suspectsBlock(input),
     "",
-    ...otherDetails(input),
-    "",
-    trafficFooter(input),
-    "",
-    ...actionCommands(input.sha),
+    ...awaitingHumanBlock(input.sha, input.baseline_sha ?? input.previousSha),
   ];
   return tidy(lines);
 }
@@ -405,97 +456,300 @@ export function formatRegressionAlert(input: CopyInput): string {
 export function formatPostmortem(input: CopyInput & { outcome: string }): string {
   const sha7 = shortSha(input.sha);
   const change = primaryChange(input);
-  const commit = primaryCommit(input);
+  const detected = utcStamp(input.awaitingAt ?? input.deployedAt, true);
+  const resolvedDate = asDate(input.resolvedAt ?? new Date());
+  const detectedDate = asDate(input.awaitingAt ?? input.deployedAt);
+  const resolved =
+    resolvedDate.toISOString().slice(0, 10) === detectedDate.toISOString().slice(0, 10)
+      ? `${resolvedDate.toISOString().slice(11, 16)} UTC`
+      : `${utcStamp(resolvedDate, false)} UTC`;
+  const pr = change ? `#${change.pr_number}` : "—";
+  const author = change?.author ? at(change.author) : whoCompact(input) || "unknown";
+
   const lines = [
-    headline(input),
+    `# Postmortem — ${verdictSlug(input.verdict)} · \`${sha7}\``,
     "",
-    moneyLine(input),
+    `**Deploy:** \`${sha7}\` · **PR:** ${pr} · **Author:** ${author}`,
+    `**Detected:** ${detected} UTC · **Resolved:** ${resolved}`,
+    `**Impact:** ${impactLine(input)}`,
     "",
-    ...predictedParagraph(input),
+    "## Summary",
+    postmortemSummary(input),
     "",
-    "## What shipped",
+    "## Timeline",
+    "| Time | Event |",
+    "|---|---|",
+    ...timelineRows(input),
+    "",
+    "## Root cause",
+    rootCauseLine(input),
+    "",
+    "## Detection",
+    detectionLine(input),
+    "",
+    "## Resolution",
+    resolutionLine(input),
+    "",
+    "## Prediction accuracy",
+    predictionAccuracyLine(input),
+    "",
+    "## Action items",
+    ...actionItems(input),
   ];
-  if (change) {
-    const branch =
-      change.head && change.base
-        ? `\`${change.head}\` into \`${change.base}\``
-        : change.head
-          ? `\`${change.head}\``
-          : "";
-    lines.push(`${prLink(change.pr_number, change.title)} by ${at(change.author)}${branch ? ` · ${branch}` : ""}`);
-  }
-  if (commit) {
-    lines.push(`Head commit \`${shortSha(commit.sha)}\` — ${subject(commit.message)} (${at(commit.author)})`);
-  } else {
-    lines.push(`Deploy \`${sha7}\``);
-  }
-  if (input.commits?.length) {
-    lines.push("", "Commits:");
-    for (const c of input.commits) {
-      lines.push(`- \`${shortSha(c.sha)}\` ${subject(c.message)} — ${at(c.author)}`);
-    }
-  }
-  if (input.files?.length) {
-    lines.push("", "Files:");
-    for (const f of input.files.slice(0, 12)) lines.push(`- \`${f}\``);
-  }
-  if (input.compareUrl) lines.push("", `[Diff vs baseline](${input.compareUrl})`);
-
-  lines.push("", "## Traffic", "");
-  const base7 = input.baseline_sha ? shortSha(input.baseline_sha) : "baseline";
-  lines.push(
-    `\`${base7}\` — ${input.baseline.n} requests, ${usd(input.baseline.cost_per_req)}/req, ${ms(input.baseline.latency_ms)}, ${errPct(input.baseline.error_rate)} errors`,
-    "",
-    `\`${sha7}\` — ${input.current.n} requests, ${usd(input.current.cost_per_req)}/req, ${ms(input.current.latency_ms)}, ${errPct(input.current.error_rate)} errors`,
-  );
-
-  lines.push("", "## Cause", "");
-  lines.push(...causeBlock(input).filter((l) => l !== "**Most likely cause**"));
-  const extras = collapseSuspects(input.suspects).slice(1);
-  if (extras.length) {
-    lines.push("", "Also involved:");
-    for (const s of extras) {
-      const file = fileFrom(s.reason);
-      const pr = s.pr_number != null ? `#${s.pr_number}` : "";
-      lines.push(`- ${[pr, at(s.author_login), file ? `\`${file}\`` : ""].filter(Boolean).join(" ")}`);
-    }
-  }
-
-  lines.push("", "## Decision", "", decisionLine(input.outcome, sha7, input));
   return tidy(lines);
+}
+
+export type LedgerFacts = {
+  sha: string;
+  deployedAt?: string | null;
+  pr?: string;
+  author?: string;
+  model?: string;
+  requests?: number;
+  costPerReq?: number | null;
+  deltaCost?: number | null;
+  p95?: number | null;
+  deltaLatency?: number | null;
+  errorRate?: number | null;
+  verdict: string;
+  predicted?: number | null;
+  errorPp?: number | null;
+  outcome: string;
+  baseline?: string | null;
+};
+
+function costCell(n: number): string {
+  if (!Number.isFinite(n)) return "";
+  if (Math.abs(n) >= 1) return n.toFixed(2);
+  return n.toFixed(4);
+}
+
+export function dominantModel(slice?: CopySlice): string {
+  const models = [...(slice?.by_model ?? [])].sort((a, b) => (b.n ?? 0) - (a.n ?? 0));
+  const raw = models[0]?.model ?? "";
+  return raw.replace(/^openai\//, "");
+}
+
+export function ledgerOutcome(outcome: string): string {
+  const o = outcome.toLowerCase();
+  if (o.includes("rollback") && !o.includes("no")) return "rolled_back";
+  if (o === "keep" || o.includes("monitor")) return "kept";
+  if (o === "timeout") return "timeout";
+  if (o === "ok" || o === "evaluated_ok") return "ok";
+  if (o.includes("skip")) return "skipped_revert";
+  if (o.includes("insufficient")) return "insufficient_data";
+  if (o === "awaiting" || o === "open" || o === "alerted") return "awaiting";
+  return o.replace(/\s+/g, "_");
+}
+
+export function formatLedgerFacts(f: LedgerFacts): string[] {
+  return [
+    shortSha(f.sha),
+    f.deployedAt ? utcStamp(f.deployedAt, false) : "",
+    f.pr ?? "",
+    f.author ?? "",
+    f.model ?? "",
+    f.requests != null ? String(f.requests) : "",
+    f.costPerReq != null && Number.isFinite(f.costPerReq) ? costCell(f.costPerReq) : "",
+    f.deltaCost != null && Number.isFinite(f.deltaCost) ? pct(f.deltaCost) : "",
+    f.p95 != null && Number.isFinite(f.p95) ? String(Math.round(f.p95)) : "",
+    f.deltaLatency != null && Number.isFinite(f.deltaLatency) ? pct(f.deltaLatency) : "",
+    f.errorRate != null && Number.isFinite(f.errorRate) ? errPct(f.errorRate) : "",
+    f.verdict || "",
+    f.predicted != null && Number.isFinite(f.predicted) ? pct(f.predicted) : "",
+    f.errorPp != null && Number.isFinite(f.errorPp) ? String(Math.round(f.errorPp)) : "",
+    ledgerOutcome(f.outcome),
+    f.baseline ? shortSha(f.baseline) : "",
+  ];
 }
 
 export function formatLedgerRow(input: CopyInput & { outcome: string }): string[] {
   const change = primaryChange(input);
-  const commit = primaryCommit(input);
-  const what = commit
-    ? `${whatHappened(input)} — ${subject(commit.message)}`
-    : whatHappened(input);
-  return [
-    whenStamp(input.deployedAt),
-    shortSha(input.sha),
-    what,
-    predictedVsLive(input),
-    whoCompact(input) || "unknown",
-    ledgerAction(input.outcome),
-    change ? `#${change.pr_number}` : postmortemTitle(input.deployedAt),
+  const login = change?.author || input.authors?.[0] || "";
+  const predicted = input.predicted_cost_delta_pct;
+  const errorPp =
+    input.predictionErrorPp ??
+    (predicted != null ? input.actual_cost_delta_pct - predicted : null);
+  return formatLedgerFacts({
+    sha: input.sha,
+    deployedAt: input.deployedAt,
+    pr: change ? prHref(change.pr_number) : "",
+    author: login ? at(login) : "",
+    model: dominantModel(input.current),
+    requests: input.current.n,
+    costPerReq: input.current.cost_per_req,
+    deltaCost: input.actual_cost_delta_pct,
+    p95: input.current.latency_p95_ms ?? input.current.latency_ms,
+    deltaLatency: input.actual_latency_delta_pct,
+    errorRate: input.current.error_rate,
+    verdict: input.verdict,
+    predicted,
+    errorPp,
+    outcome: input.outcome,
+    baseline: input.baseline_sha ?? input.previousSha,
+  });
+}
+
+function predictionAccuracyLine(input: CopyInput): string {
+  const predicted = input.predicted_cost_delta_pct;
+  if (input.verdict === "error_spike") {
+    const flags = (input.errorRiskFlags ?? []).filter(Boolean);
+    const actual = errPct(input.current.error_rate);
+    if (flags.length) {
+      const flagLine = flags.map((f) => `\`${f.slice(0, 80)}\``).join("; ");
+      return `INSIGHT flagged error-handling risk: ${flagLine}. Actual error rate: ${actual}.`;
+    }
+    return `INSIGHT did not flag error risk on the PR. Actual error rate: ${actual}.`;
+  }
+  if (input.verdict === "latency_regression") {
+    const predL = input.predicted_latency_delta_pct;
+    const actualL = pct(input.actual_latency_delta_pct);
+    return predL != null
+      ? `Predicted latency ${pct(predL)} · Actual ${actualL}.`
+      : `No latency prediction for this SHA. Actual latency ${actualL}.`;
+  }
+  if (predicted == null) return "No INSIGHT prediction for this SHA.";
+  const errorPp =
+    input.predictionErrorPp ??
+    input.actual_cost_delta_pct - predicted;
+  return `Predicted ${pct(predicted)} · Actual ${pct(input.actual_cost_delta_pct)} · Error ${Math.round(errorPp)}pp`;
+}
+
+function impactLine(input: CopyInput): string {
+  const n = input.current.n;
+  const over = `over ${n} request${n === 1 ? "" : "s"}`;
+  if (input.verdict === "error_spike") {
+    return `error rate ${errPct(input.baseline.error_rate)} → ${errPct(input.current.error_rate)} ${over}`;
+  }
+  if (input.verdict === "latency_regression") {
+    const from = input.baseline.latency_p95_ms ?? input.baseline.latency_ms;
+    const to = input.current.latency_p95_ms ?? input.current.latency_ms;
+    return `p95 ${ms(from)} → ${ms(to)} (${pct(input.actual_latency_delta_pct)}) ${over}`;
+  }
+  return `cost/request ${usd(input.baseline.cost_per_req)} → ${usd(input.current.cost_per_req)} (${pct(input.actual_cost_delta_pct)}) ${over}`;
+}
+
+function postmortemSummary(input: CopyInput & { outcome: string }): string {
+  const sha7 = shortSha(input.sha);
+  const change = primaryChange(input);
+  const pr = change ? ` (PR #${change.pr_number})` : "";
+  const base = input.baseline_sha ? `\`${shortSha(input.baseline_sha)}\`` : "the previous release";
+  const end = decisionLine(input.outcome, sha7, input);
+  return `Deploy \`${sha7}\`${pr} was a ${verdictSlug(input.verdict)} vs ${base}. ${impactLine(input)}. ${end}`;
+}
+
+function timelineRows(input: CopyInput & { outcome: string }): string[] {
+  const sha7 = shortSha(input.sha);
+  const change = primaryChange(input);
+  const deployT = utcStamp(input.deployedAt, false);
+  const detectT = utcStamp(input.awaitingAt ?? input.deployedAt, false);
+  const resolveT = utcStamp(input.resolvedAt ?? new Date(), false);
+  const pred =
+    input.predicted_cost_delta_pct != null ? ` (INSIGHT predicted ${pct(input.predicted_cost_delta_pct)})` : "";
+  const rows = [
+    `| ${deployT} | ${change ? `PR #${change.pr_number} merged${pred}` : `Deploy \`${sha7}\` recorded${pred}`} |`,
+    `| ${deployT} | Deploy \`${sha7}\` live |`,
+    `| ${detectT} | Threshold breached after ${input.current.n} requests |`,
+    `| ${detectT} | Alert posted, approval requested |`,
   ];
+  const o = input.outcome.toLowerCase();
+  if (o.includes("rollback") && !o.includes("no")) {
+    const who = change?.author ? at(change.author) : "human";
+    rows.push(`| ${resolveT} | Rollback approved by ${who} |`);
+    const revert = input.revertSha ? `\`${shortSha(input.revertSha)}\`` : "revert commit";
+    rows.push(`| ${resolveT} | Revert ${revert} deployed |`);
+  } else if (o === "timeout") {
+    rows.push(`| ${resolveT} | No approval in time — kept watching, no rollback |`);
+  } else {
+    rows.push(`| ${resolveT} | Keep command — no rollback |`);
+  }
+  return rows;
 }
 
-function ledgerAction(outcome: string): string {
-  const o = outcome.toLowerCase();
-  if (o === "awaiting" || o === "open") return "waiting";
-  if (o.includes("rollback") && !o.includes("no")) return "rolled back";
-  if (o === "timeout") return "no approval";
-  if (o === "keep" || o.includes("monitor")) return "kept";
-  return outcome;
+function rootCauseLine(input: CopyInput): string {
+  const patch = pickPatch(input);
+  const model = modelShift(input);
+  const commit = primaryCommit(input);
+  const bits: string[] = [];
+  if (patch?.line != null) {
+    bits.push(`\`${patch.filename}:${patch.line}\`${patch.added ? ` \`${patch.added.slice(0, 120)}\`` : ""}`);
+  } else if (patch) {
+    bits.push(`\`${patch.filename}\``);
+  } else if (input.files?.[0]) {
+    bits.push(`\`${input.files[0]}\``);
+  }
+  if (model) bits.push(`model ${model}`);
+  if (commit) bits.push(`\`${shortSha(commit.sha)}\` ${subject(commit.message)}`);
+  if (input.rootCause) bits.push(sentence(input.rootCause));
+  return bits.join(" — ") || "No single file stood out in the compare.";
 }
 
-export function formatInsightComment(input: {
+function pickPatch(input: CopyInput): CopyPatch | undefined {
+  const patches = input.patches ?? [];
+  const scored = [...patches].sort((a, b) => scorePatch(b) - scorePatch(a));
+  return scored[0];
+}
+
+function scorePatch(p: CopyPatch): number {
+  const f = p.filename.toLowerCase();
+  let n = 0;
+  if (f.includes("chat") || f.includes("route")) n += 5;
+  if (p.added?.toLowerCase().includes("gpt") || p.added?.toLowerCase().includes("model")) n += 4;
+  if (p.line != null) n += 1;
+  return n;
+}
+
+function detectionLine(input: CopyInput): string {
+  const n = input.current.n;
+  const min = config.minRequests;
+  const base = input.baseline_sha ? `\`${shortSha(input.baseline_sha)}\`` : "baseline";
+  if (input.verdict === "error_spike") {
+    return `Error rate ${errPct(input.current.error_rate)} vs ${base} after ${n} requests (threshold 5% and 2× baseline, min ${min} requests).`;
+  }
+  if (input.verdict === "latency_regression") {
+    return `Latency ${pct(input.actual_latency_delta_pct)} vs ${base} after ${n} requests (threshold ${pct(config.latencyRegressionPct)}, min ${min} requests).`;
+  }
+  return `Cost/request ${pct(input.actual_cost_delta_pct)} vs ${base} after ${n} requests (threshold ${pct(config.costRegressionPct)}, min ${min} requests).`;
+}
+
+function resolutionLine(input: CopyInput & { outcome: string }): string {
+  const sha7 = shortSha(input.sha);
+  const o = input.outcome.toLowerCase();
+  if (o.includes("rollback") && !o.includes("no")) {
+    const prev = input.previousSha ? `\`${shortSha(input.previousSha)}\`` : "the previous release";
+    const revert = input.revertSha ? ` Revert \`${shortSha(input.revertSha)}\`.` : "";
+    return `Human posted \`${cmd("rollback", sha7)}\`. Rolled back to ${prev}.${revert} Rollback is never automatic.`;
+  }
+  if (o === "timeout") {
+    return `No command in ${config.pollMinutes} min. I did not roll back. Still watching \`${sha7}\`.`;
+  }
+  return `Human posted \`${cmd("keep", sha7)}\`. No rollback. Still watching \`${sha7}\`.`;
+}
+
+function actionItems(input: CopyInput): string[] {
+  const owner = primaryChange(input)?.author
+    ? at(primaryChange(input)!.author)
+    : input.authors?.[0]
+      ? at(input.authors[0])
+      : "@owner";
+  if (input.verdict === "error_spike") {
+    return [`- [ ] Fail closed on 5xx before full traffic — ${owner}`];
+  }
+  if (input.verdict === "latency_regression") {
+    return [`- [ ] Cap max_tokens and extra completion passes on /api/chat — ${owner}`];
+  }
+  return [`- [ ] Block unreviewed production model bumps — ${owner}`];
+}
+
+export type InsightCommentInput = {
   prNumber: number;
   sha: string;
   costPct: number;
   latencyPct: number;
+  costWhy?: string;
+  endpointRisks?: string[];
+  errorRisks?: string[];
+  promptRisks?: string[];
   errorRisk?: string;
   touches: string[];
   authors: string[];
@@ -503,21 +757,103 @@ export function formatInsightComment(input: {
   title?: string;
   head?: string;
   base?: string;
-}): string {
+  primaryPatch?: { filename: string; rawPatch?: string };
+};
+
+function riskEmoji(magnitude: "high" | "medium" | "low" | "none"): string {
+  if (magnitude === "high") return "🔴";
+  if (magnitude === "medium") return "🟡";
+  if (magnitude === "low") return "🟢";
+  return "⚪";
+}
+
+function costRisk(pctVal: number): "high" | "medium" | "low" {
+  const abs = Math.abs(pctVal);
+  if (abs >= 100) return "high";
+  if (abs >= 20) return "medium";
+  return "low";
+}
+
+function latencyRisk(pctVal: number): "high" | "medium" | "low" {
+  const abs = Math.abs(pctVal);
+  if (abs >= 50) return "high";
+  if (abs >= 15) return "medium";
+  return "low";
+}
+
+export function formatInsightComment(input: InsightCommentInput): string {
   const sha7 = shortSha(input.sha);
   const branch =
     input.head && input.base ? ` \`${input.head}\` → \`${input.base}\`` : input.head ? ` \`${input.head}\`` : "";
-  const lines = [
-    `🔍 **Cost estimate** · \`${sha7}\` · ${prLink(input.prNumber, input.title)}${branch}`,
+  const errors = input.errorRisks?.length
+    ? input.errorRisks
+    : input.errorRisk
+      ? [input.errorRisk.replace(/^error risk\s+/i, "")]
+      : [];
+  const endpoints = input.endpointRisks ?? [];
+  const prompts = input.promptRisks ?? [];
+
+  const errorMag = errors.length ? "high" : "low";
+  const promptMag = prompts.length ? "medium" : "low";
+
+  const lines: string[] = [
+    `🔍 **INSIGHT** · pre-merge analysis of \`${sha7}\` · ${prLink(input.prNumber, input.title)}${branch}`,
     "",
-    `I think this PR is **${pct(input.costPct)} cost** and **${pct(input.latencyPct)} latency** vs production.`,
+    `**Expected cost:** **${pct(input.costPct)}** per request (deterministic, from price table)`,
+    `**Expected latency:** ${pct(input.latencyPct)} (LLM class estimate)`,
+    `**Expected errors:** ${errors.length ? "increase likely — see below" : "unchanged"}`,
   ];
-  if (input.errorRisk) lines.push(sentence(input.errorRisk.replace(/^error risk\s+/i, "")));
-  if (input.touches.length) lines.push(`Touches ${input.touches.join(", ")}.`);
+
+  if (input.primaryPatch?.rawPatch) {
+    lines.push(
+      "",
+      `**Changes** — \`${input.primaryPatch.filename}\``,
+      "```diff",
+      trimDiff(input.primaryPatch.rawPatch, 18),
+      "```",
+    );
+  }
+
+  lines.push("", "**Risk flags**");
+  lines.push(
+    `- ${riskEmoji(costRisk(input.costPct))} **Cost** — ${input.costWhy ? sentence(input.costWhy) : `${pct(input.costPct)} per request from price table.`}`,
+  );
+  lines.push(
+    `- ${riskEmoji(latencyRisk(input.latencyPct))} **Latency** — ${
+      endpoints.length ? endpoints.map((r) => sentence(r)).join(" ") : `${pct(input.latencyPct)} estimated.`
+    }`,
+  );
+  lines.push(
+    `- ${riskEmoji(errorMag)} **Errors** — ${errors.length ? errors.map((r) => sentence(r)).join(" ") : "no new failure paths detected."}`,
+  );
+  if (prompts.length) {
+    lines.push(`- ${riskEmoji(promptMag)} **Prompt** — ${prompts.map((r) => sentence(r)).join(" ")}`);
+  }
+
+  if (input.touches.length) lines.push("", `Touches ${input.touches.join(", ")}.`);
   if (input.authors.length) lines.push(input.authors.map((a) => at(a)).join("  "));
   if (input.rationale.trim()) lines.push("", input.rationale.trim());
-  lines.push("", "After merge I will score this prediction against live traffic.");
+  lines.push("", "I'll score this prediction against live traffic after merge.");
   return tidy(lines);
+}
+
+export function formatInsightChannel(input: {
+  prNumber: number;
+  sha: string;
+  costPct: number;
+  latencyPct: number;
+  title?: string;
+  errorRisks?: string[];
+  endpointRisks?: string[];
+}): string {
+  const sha7 = shortSha(input.sha);
+  const risk = input.errorRisks?.[0] || input.endpointRisks?.[0];
+  return tidy([
+    `🔍 **INSIGHT** · \`${sha7}\` · ${prLink(input.prNumber, input.title)}`,
+    `Deterministic cost **${pct(input.costPct)}**. Latency estimate **${pct(input.latencyPct)}**.`,
+    risk ? sentence(risk) : "",
+    "PR comment has the three-tier breakdown. I will score cost against live traffic after merge.",
+  ]);
 }
 
 export function decisionLine(outcome: string, sha7: string, input?: CopyInput): string {
@@ -580,5 +916,10 @@ export function formatRollbackReply(
 
 export function formatStatusReply(sha: string, input: CopyInput | null, fallback: string): string {
   if (!input) return tidy([sentence(fallback)]);
-  return tidy([headline(input), moneyLine(input), ...predictedParagraph(input), trafficFooter(input)]);
+  const sha7 = shortSha(sha);
+  return tidy([
+    `${alertMark(input.verdict)} **${verdictLabel(input.verdict)}** · \`${sha7}\``,
+    "",
+    ...alertImpactLines(input),
+  ]);
 }

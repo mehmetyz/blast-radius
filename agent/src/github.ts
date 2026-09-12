@@ -130,7 +130,8 @@ export async function commentOnPr(pr: number, body: string): Promise<void> {
     (c) =>
       c.body.startsWith("/blast-radius insight") ||
       c.body.startsWith("## Blast Radius INSIGHT") ||
-      c.body.includes("**Cost estimate**"),
+      c.body.includes("**Cost estimate**") ||
+      c.body.includes("**INSIGHT**"),
   );
   if (existing) {
     await github(`/repos/${owner}/${name}/issues/comments/${existing.id}`, {

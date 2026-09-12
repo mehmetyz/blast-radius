@@ -23,4 +23,10 @@ app.post("/webhooks/vercel", vercelWebhook);
 app.listen(config.port, () => {
   console.log(`blast-radius agent listening on :${config.port}`);
   startWorker();
+  void import("./ledger.js")
+    .then(async ({ ensureLedgerSurface, refreshPostmortems }) => {
+      await ensureLedgerSurface();
+      await refreshPostmortems();
+    })
+    .catch((err) => console.error("ledger surface", err));
 });

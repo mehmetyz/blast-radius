@@ -89,7 +89,10 @@ CREATE TABLE IF NOT EXISTS actions (
   task_id TEXT,
   doc_id TEXT,
   rollback_executed INTEGER NOT NULL DEFAULT 0,
-  awaiting_at TEXT
+  awaiting_at TEXT,
+  doc_hash TEXT,
+  doc_title TEXT,
+  resolved_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS remediations (

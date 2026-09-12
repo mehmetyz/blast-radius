@@ -8,7 +8,10 @@ const insertEvent = db.prepare(
 const getEvent = db.prepare(`SELECT delivery_id FROM processed_events WHERE delivery_id = ?`);
 const getDeploy = db.prepare(`SELECT * FROM deploys WHERE sha = ?`);
 const lastRelease = db.prepare(
-  `SELECT sha FROM deploys WHERE origin = 'release' ORDER BY deployed_at DESC LIMIT 1`,
+  `SELECT sha FROM deploys
+    WHERE origin = 'release'
+      AND status NOT IN ('rolled_back', 'skipped_revert')
+    ORDER BY deployed_at DESC LIMIT 1`,
 );
 const pendingFor = db.prepare(
   `SELECT id, rolled_back_sha FROM pending_reverts WHERE consumed_at IS NULL ORDER BY id DESC LIMIT 1`,
@@ -97,6 +100,9 @@ export function recordDeploy(input: RecordDeployInput) {
         ),
       )
       .catch((err) => console.error("revert follow-up", err));
+    void import("./ledger.js")
+      .then(({ appendLedgerRow }) => appendLedgerRow(sha, "skipped_revert"))
+      .catch((err) => console.error("ledger revert", err));
   }
 
   return { sha, skipped: false as const, origin, previous_sha: previousSha, status, request_count: n };

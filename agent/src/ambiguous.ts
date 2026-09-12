@@ -8,6 +8,7 @@ export type ChannelMessage = {
   thread_key: string | null;
   content: string;
   deleted_at?: string | null;
+  poll_id?: string | null;
 };
 
 async function ambiguous<T>(path: string, init: RequestInit = {}, key = config.ambiguousApiKey): Promise<T> {
@@ -25,11 +26,18 @@ async function ambiguous<T>(path: string, init: RequestInit = {}, key = config.a
     const text = await res.text();
     throw new Error(`Ambiguous ${res.status} ${path.split("/").pop()}: ${text.slice(0, 180)}`);
   }
-  return (await res.json()) as T;
+  if (res.status === 204) return undefined as T;
+  const text = await res.text();
+  if (!text) return undefined as T;
+  return JSON.parse(text) as T;
 }
 
 function sheetKey(): string {
   return config.ambiguousWorkspaceKey || config.ambiguousApiKey;
+}
+
+export function workspaceApiKey(): string {
+  return sheetKey();
 }
 
 function channelPath(suffix: string): string {
@@ -37,9 +45,30 @@ function channelPath(suffix: string): string {
   return `/api/channels/${config.ambiguousChannelId}${suffix}`;
 }
 
-export async function listMessages(limit = 50): Promise<ChannelMessage[]> {
-  const res = await ambiguous<{ data?: ChannelMessage[] }>(channelPath(`/messages?limit=${limit}`));
+export async function listMessages(
+  limit = 50,
+  opts: { before?: string; key?: string } = {},
+): Promise<ChannelMessage[]> {
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (opts.before) params.set("before", opts.before);
+  const res = await ambiguous<{ data?: ChannelMessage[] }>(
+    channelPath(`/messages?${params}`),
+    {},
+    opts.key,
+  );
   return res.data ?? [];
+}
+
+export async function listThreadReplies(
+  messageId: string,
+  key?: string,
+): Promise<ChannelMessage[]> {
+  const res = await ambiguous<{ replies?: ChannelMessage[]; data?: ChannelMessage[] }>(
+    channelPath(`/messages/${messageId}/thread?limit=100`),
+    {},
+    key,
+  );
+  return res.replies ?? res.data ?? [];
 }
 
 export async function findMessageByThreadKey(threadKey: string): Promise<ChannelMessage | undefined> {
@@ -71,12 +100,23 @@ export async function postMessage(content: string, threadKey?: string | null, st
   });
 }
 
-export async function deleteMessages(messageIds: string[]): Promise<{ deleted?: string[]; rejected?: string[] }> {
+export async function deleteMessages(
+  messageIds: string[],
+  key?: string,
+): Promise<{ deleted?: string[]; rejected?: string[] }> {
   if (!messageIds.length) return { deleted: [] };
-  return ambiguous(channelPath("/messages/bulk-delete"), {
-    method: "POST",
-    body: JSON.stringify({ message_ids: messageIds.slice(0, 100) }),
-  });
+  return ambiguous(
+    channelPath("/messages/bulk-delete"),
+    {
+      method: "POST",
+      body: JSON.stringify({ message_ids: messageIds.slice(0, 100) }),
+    },
+    key,
+  );
+}
+
+export async function deleteMessage(messageId: string, key?: string) {
+  return ambiguous(channelPath(`/messages/${messageId}`), { method: "DELETE" }, key);
 }
 
 export type WorkspaceUser = {
@@ -146,14 +186,14 @@ export async function getSheetRange(sheetId: string, spec = "A1:Z50"): Promise<s
   const rows = res.data?.sheets?.[0]?.rows;
   if (rows?.length) {
     const cols = "ABCDEFGHIJKLMNOPQRSTUVWXYZ".split("");
-    return rows.map((row) => cols.slice(0, 8).map((c) => row[c] ?? ""));
+    return rows.map((row) => cols.slice(0, 16).map((c) => row[c] ?? ""));
   }
   return res.values ?? [];
 }
 
 function cellsFrom(values: string[][], startRow = 0) {
   const cells: { row: number; column: string; value: string }[] = [];
-  const width = Math.max(8, ...values.map((r) => r.length));
+  const width = Math.max(16, ...values.map((r) => r.length));
   for (let r = 0; r < values.length; r++) {
     for (let c = 0; c < width; c++) {
       cells.push({
@@ -166,17 +206,22 @@ function cellsFrom(values: string[][], startRow = 0) {
   return cells;
 }
 
-export async function updateSheetValues(sheetId: string, values: string[][], _range = "A1") {
-  const padded = [...values];
-  while (padded.length < 4) padded.push([]);
+export async function patchSheetCells(
+  sheetId: string,
+  cells: { row: number; column: string; value: string }[],
+) {
   return ambiguous(
     `/api/sheets/${sheetId}/cells`,
     {
       method: "PATCH",
-      body: JSON.stringify({ cells: cellsFrom(padded) }),
+      body: JSON.stringify({ cells }),
     },
     sheetKey(),
   );
+}
+
+export async function updateSheetValues(sheetId: string, values: string[][], _range = "A1") {
+  return patchSheetCells(sheetId, cellsFrom(values));
 }
 
 export type DocumentSummary = {
@@ -187,6 +232,10 @@ export type DocumentSummary = {
 export async function listDocuments(): Promise<DocumentSummary[]> {
   const res = await ambiguous<{ data?: DocumentSummary[] }>("/api/documents");
   return res.data ?? [];
+}
+
+export async function deleteDocument(id: string): Promise<void> {
+  await ambiguous(`/api/documents/${id}`, { method: "DELETE" }, sheetKey());
 }
 
 export async function createDocument(title: string, markdown: string): Promise<{ id: string }> {
@@ -300,6 +349,20 @@ export async function closePoll(pollId: string): Promise<Poll> {
   return ambiguous<Poll>(`/api/polls/${pollId}/close`, { method: "POST" });
 }
 
+export async function getPollByMessage(messageId: string, key?: string): Promise<Poll | null> {
+  try {
+    const res = await ambiguous<Poll & { poll?: Poll }>(`/api/polls/by-message/${messageId}`, {}, key);
+    const poll = res.id ? res : res.poll;
+    return poll?.id ? poll : null;
+  } catch {
+    return null;
+  }
+}
+
+export async function deletePoll(pollId: string, key?: string) {
+  return ambiguous(`/api/polls/${pollId}`, { method: "DELETE" }, key);
+}
+
 export async function createTask(input: {
   title: string;
   description?: string;
@@ -319,4 +382,31 @@ export async function createTask(input: {
   const id = res.task?.id ?? res.id;
   if (!id) throw new Error("task create returned no id");
   return { id };
+}
+
+export type TaskSummary = {
+  id: string;
+  title?: string;
+};
+
+export async function listTasks(
+  opts: { q?: string; limit?: number; cursor?: string; key?: string } = {},
+): Promise<TaskSummary[]> {
+  const params = new URLSearchParams({ limit: String(opts.limit ?? 100) });
+  if (opts.q) params.set("q", opts.q);
+  if (opts.cursor) params.set("cursor", opts.cursor);
+  const res = await ambiguous<{ data?: TaskSummary[]; tasks?: TaskSummary[] }>(
+    `/api/tasks?${params}`,
+    {},
+    opts.key,
+  );
+  return res.data ?? res.tasks ?? [];
+}
+
+export async function deleteTask(id: string, key?: string) {
+  return ambiguous(`/api/tasks/${id}`, { method: "DELETE" }, key);
+}
+
+export async function permanentlyDeleteTask(id: string, key?: string) {
+  return ambiguous(`/api/tasks/${id}/permanent`, { method: "DELETE" }, key);
 }

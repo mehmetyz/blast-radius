@@ -21,7 +21,9 @@ app.get("/deploys/:sha", getDeployBySha);
 app.post("/webhooks/vercel", vercelWebhook);
 
 app.listen(config.port, () => {
-  console.log(`blast-radius agent listening on :${config.port}`);
+  console.log(
+    `blast-radius agent listening on :${config.port} (minRequests=${config.minRequests}, costΔ=${config.costRegressionPct}%, latencyΔ=${config.latencyRegressionPct}%)`,
+  );
   startWorker();
   void import("./ledger.js")
     .then(async ({ ensureLedgerSurface, refreshPostmortems }) => {
@@ -29,4 +31,7 @@ app.listen(config.port, () => {
       await refreshPostmortems();
     })
     .catch((err) => console.error("ledger surface", err));
+  void import("./rollbackQueue.js")
+    .then(({ recoverStaleIntents }) => recoverStaleIntents())
+    .catch((err) => console.error("rollback queue recover", err));
 });

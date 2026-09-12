@@ -306,7 +306,7 @@ export async function appendLedgerRow(sha: string, outcome: string) {
 export async function writePostmortem(
   sha: string,
   outcome: string,
-  extras: { revertSha?: string | null; resolvedAt?: string } = {},
+  extras: { revertSha?: string | null; resolvedAt?: string; rollbackTarget?: string | null } = {},
 ): Promise<string | null> {
   const existing = getAction.get(sha) as
     | {
@@ -369,10 +369,16 @@ export async function writePostmortem(
         error_rate: snap.error_rate ?? input.current.error_rate,
       },
     };
+    // The surgical rollback target persists in the intent's filter — refreshes
+    // must show the real target, not the evaluation baseline.
+    const intentTarget = db
+      .prepare(`SELECT filter FROM rollback_intents WHERE sha = ? AND status = 'done' ORDER BY id DESC LIMIT 1`)
+      .get(sha) as { filter: string | null } | undefined;
     const markdown = formatPostmortem({
       ...docInput,
       outcome,
       revertSha: extras.revertSha ?? revertRow?.sha ?? input.revertSha ?? null,
+      rollbackTarget: extras.rollbackTarget ?? intentTarget?.filter ?? input.rollbackTarget ?? null,
       resolvedAt,
     });
     const title = postmortemTitle({ sha, verdict: snap.verdict, deployedAt: snap.created_at });

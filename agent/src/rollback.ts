@@ -50,7 +50,7 @@ export async function executeRollback(
     setStatus.run("rolled_back", sha);
     db.prepare(`UPDATE actions SET outcome = 'rollback' WHERE sha = ?`).run(sha);
     try {
-      await writePostmortem(sha, "rollback", { revertSha });
+      await writePostmortem(sha, "rollback", { revertSha, rollbackTarget: previousSha });
     } catch (err) {
       console.error(`postmortem ${sha7}`, err);
     }

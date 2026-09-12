@@ -153,6 +153,7 @@ export type CopyInput = {
   awaitingAt?: string | null;
   resolvedAt?: string | null;
   revertSha?: string | null;
+  rollbackTarget?: string | null;
   predictionErrorPp?: number | null;
   errorLog?: { message: string; count: number }[];
   errorPairs?: { error: string; commit_sha: string | null; message: string; author: string | null }[];
@@ -775,7 +776,8 @@ function postmortemSummary(input: CopyInput & { outcome: string }): string {
   const pr = change ? ` (PR #${change.pr_number})` : "";
   const base = input.baseline_sha ? `\`${shortSha(input.baseline_sha)}\`` : "the previous release";
   const end = decisionLine(input.outcome, sha7, input);
-  return `Deploy \`${sha7}\`${pr} was a ${verdictSlug(input.verdict)} vs ${base}. ${impactLine(input)}. ${end}`;
+  const v = verdictSlug(input.verdict);
+  return `Deploy \`${sha7}\`${pr} was ${/^[aeiou]/.test(v) ? "an" : "a"} ${v} vs ${base}. ${impactLine(input)}. ${end}`;
 }
 
 function timelineRows(input: CopyInput & { outcome: string }): string[] {
@@ -806,14 +808,37 @@ function timelineRows(input: CopyInput & { outcome: string }): string[] {
   return rows;
 }
 
+function firstMeaningfulAdded(rawPatch?: string): { line: number; text: string } | undefined {
+  if (!rawPatch) return undefined;
+  let newLine = 0;
+  for (const l of rawPatch.split("\n")) {
+    const hunk = /^@@ -\d+(?:,\d+)? \+(\d+)/.exec(l);
+    if (hunk) {
+      newLine = Number(hunk[1]);
+      continue;
+    }
+    if (l.startsWith("+") && !l.startsWith("+++")) {
+      newLine += 1;
+      const t = l.slice(1).trim();
+      if (!t || t.startsWith("//") || t.startsWith("*")) continue;
+      if (/^(import |from |export \{)/.test(t)) continue;
+      return { line: newLine, text: t.slice(0, 120) };
+    }
+    if (!l.startsWith("-")) newLine += 1;
+  }
+  return undefined;
+}
+
 function rootCauseLine(input: CopyInput): string {
   const patch = pickPatch(input);
-  const model = modelShift(input);
+  const meaningful = firstMeaningfulAdded(patch?.rawPatch);
+  // The model shift only explains cost verdicts — it is noise in error docs.
+  const model = input.verdict === "cost_regression" ? modelShift(input) : null;
   const commit = primaryCommit(input);
   const bits: string[] = [];
-  if (patch?.line != null) {
-    bits.push(`\`${patch.filename}:${patch.line}\`${patch.added ? ` \`${patch.added.slice(0, 120)}\`` : ""}`);
-  } else if (patch) {
+  if (meaningful) {
+    bits.push(`\`${patch!.filename}:${meaningful.line}\` \`${meaningful.text}\``);
+  } else if (patch?.filename) {
     bits.push(`\`${patch.filename}\``);
   } else if (input.files?.[0]) {
     bits.push(`\`${input.files[0]}\``);
@@ -858,7 +883,8 @@ function resolutionLine(input: CopyInput & { outcome: string }): string {
   const sha7 = shortSha(input.sha);
   const o = input.outcome.toLowerCase();
   if (o.includes("rollback") && !o.includes("no")) {
-    const prev = input.previousSha ? `\`${shortSha(input.previousSha)}\`` : "the previous release";
+    const target = input.rollbackTarget ?? input.previousSha;
+    const prev = target ? `\`${shortSha(target)}\`` : "the previous release";
     const revert = input.revertSha ? ` Revert \`${shortSha(input.revertSha)}\`.` : "";
     return `Human posted \`${cmd("rollback", sha7)}\`. Rolled back to ${prev}.${revert} Rollback is never automatic.`;
   }
@@ -1077,7 +1103,8 @@ export function formatInsightChannel(input: {
 
 export function decisionLine(outcome: string, sha7: string, input?: CopyInput): string {
   const o = outcome.toLowerCase();
-  const prev = input?.previousSha ? `\`${shortSha(input.previousSha)}\`` : "the previous release";
+  const target = input?.rollbackTarget ?? input?.previousSha;
+  const prev = target ? `\`${shortSha(target)}\`` : "the previous release";
   if (o === "awaiting" || o === "open") {
     return `Waiting on a human. Type \`${cmd("rollback", sha7)}\` or \`${cmd("keep", sha7)}\`. I will not roll back on my own.`;
   }

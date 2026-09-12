@@ -9,3 +9,6 @@ dist
 *.pem
 *.key
 *.log
+.git
+Dockerfile
+.dockerignore

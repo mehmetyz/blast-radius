@@ -1,5 +1,5 @@
 const DEMO_URL = process.env.DEMO_URL ?? "http://127.0.0.1:3000/api/chat";
-const n = Number(process.env.COUNT ?? 20);
+const n = Number(process.env.COUNT ?? process.env.MIN_REQUESTS ?? 20);
 
 async function main() {
   let ok = 0;
@@ -24,7 +24,7 @@ async function main() {
     console.log(`${i + 1}/${n} sha=${data.sha?.slice(0, 7) ?? "?"} ingest=${data.ingest_ok ? "ok" : "miss"}`);
   }
   console.log(`sent ${ok}/${n} ok, ${failed} errors, ingest_ok ${ingested} → ${DEMO_URL}`);
-  if (ingested < 20) process.exit(1);
+  if (ingested < n) process.exit(1);
 }
 
 main();

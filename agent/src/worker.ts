@@ -3,6 +3,7 @@ import { db } from "./db.js";
 import { runActiveAgent } from "./agent.js";
 import { evaluateDeploy } from "./evaluator.js";
 import { watchApprovals } from "./approval.js";
+import { processRollbackQueue } from "./rollbackQueue.js";
 
 const due = db.prepare(`
   SELECT sha FROM deploys
@@ -14,7 +15,12 @@ const stale = db.prepare(`
     AND EXISTS (
       SELECT 1 FROM deploys n
       WHERE n.origin = 'release' AND n.sha != d.sha AND n.deployed_at > d.deployed_at
+        AND n.request_count >= ?
     )
+`);
+const recover = db.prepare(`
+  UPDATE deploys SET status = 'collecting'
+   WHERE origin = 'release' AND status = 'insufficient_data' AND request_count >= ?
 `);
 const claim = db.prepare(
   `INSERT OR IGNORE INTO actions (sha, poll_id, sheet_appended, task_id, doc_id, rollback_executed) VALUES (?, NULL, 0, NULL, NULL, 0)`,
@@ -28,7 +34,11 @@ export async function tick() {
   if (ticking) return;
   ticking = true;
   try {
-    for (const { sha } of stale.all(config.minRequests) as { sha: string }[]) {
+    const recovered = recover.run(config.minRequests);
+    if (Number(recovered.changes) > 0) {
+      console.log(`recovered ${recovered.changes} insufficient_data deploy(s) with enough traffic`);
+    }
+    for (const { sha } of stale.all(config.minRequests, config.minRequests) as { sha: string }[]) {
       setStatus.run("insufficient_data", sha);
       console.log(`insufficient_data ${sha.slice(0, 7)}`);
     }
@@ -49,6 +59,7 @@ export async function tick() {
       console.log(`${after?.status ?? "alerted"} ${sha.slice(0, 7)} ${result.verdict}`);
     }
     await watchApprovals();
+    await processRollbackQueue();
   } finally {
     ticking = false;
   }

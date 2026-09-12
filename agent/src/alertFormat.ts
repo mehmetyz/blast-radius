@@ -1,5 +1,5 @@
 import { db } from "./db.js";
-import { findMessageByThreadKey, postMessage, updateMessage } from "./ambiguous.js";
+import { findMessageByThreadKey, listMessages, postMessage, updateMessage } from "./ambiguous.js";
 import { evaluateDeploy, listErrors } from "./evaluator.js";
 import { getPull, githubCompare, pullsForCommit, type LinkedPr } from "./github.js";
 import { analyzeDeployCommits, loadCommitAnalysis, type CommitClassification } from "./commitAnalysis.js";
@@ -354,11 +354,14 @@ export async function postFormattedAlert(
   const existing = await findMessageByThreadKey(sha);
   if (existing) {
     // Same verdict → update in place. Different verdict (re-evaluation) →
-    // preserve the previous alert and open a new block.
+    // preserve the previous alert and use the verdict's own thread block.
     const sameVerdict = (existing.content ?? "").includes(verdictLabel(input.verdict));
     if (sameVerdict) return updateMessage(existing.id, content);
+    const verdictKey = `${sha}-${input.verdict}`;
+    const verdictMsg = (await listMessages(100)).find((m) => m.thread_key === verdictKey);
+    if (verdictMsg) return updateMessage(verdictMsg.id, content);
     try {
-      return await postMessage(content, `${sha}-${input.verdict}`, opts.startsNewBlock ?? true);
+      return await postMessage(content, verdictKey, opts.startsNewBlock ?? true);
     } catch {
       return postMessage(content, null, opts.startsNewBlock ?? true);
     }

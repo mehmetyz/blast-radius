@@ -1,9 +1,11 @@
 import type { Request, Response } from "express";
 import { db } from "./db.js";
+import { result } from "./cmd.js";
 
 const insertEvent = db.prepare(
   `INSERT OR IGNORE INTO processed_events (delivery_id, source, received_at) VALUES (?, ?, ?)`,
 );
+const getEvent = db.prepare(`SELECT delivery_id FROM processed_events WHERE delivery_id = ?`);
 const getDeploy = db.prepare(`SELECT * FROM deploys WHERE sha = ?`);
 const lastRelease = db.prepare(
   `SELECT sha FROM deploys WHERE origin = 'release' ORDER BY deployed_at DESC LIMIT 1`,
@@ -18,7 +20,15 @@ const insertDeploy = db.prepare(`
   INSERT INTO deploys (sha, previous_sha, deployed_at, origin, reverts_sha, status, request_count, vercel_deployment_id, github_compare_url)
   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
-const telemetryCount = db.prepare(`SELECT count(*) AS n FROM telemetry WHERE sha = ?`);
+const telemetryCount = db.prepare(`
+  SELECT
+    (SELECT count(DISTINCT request_id) FROM telemetry
+      WHERE sha = ? AND request_id IS NOT NULL AND coalesce(kind, 'llm') != 'function')
+    +
+    (SELECT count(*) FROM telemetry
+      WHERE sha = ? AND request_id IS NULL AND coalesce(kind, 'llm') != 'function')
+    AS n
+`);
 
 export type RecordDeployInput = {
   sha: string;
@@ -28,9 +38,18 @@ export type RecordDeployInput = {
   source?: "github" | "vercel" | "ingest";
 };
 
+export function deliverySeen(deliveryId: string): boolean {
+  return Boolean(getEvent.get(deliveryId));
+}
+
+export function markDelivery(deliveryId: string, source: string) {
+  insertEvent.run(deliveryId, source, new Date().toISOString());
+}
+
 export function alreadyProcessed(deliveryId: string, source: string): boolean {
-  const info = insertEvent.run(deliveryId, source, new Date().toISOString());
-  return Number(info.changes) === 0;
+  if (deliverySeen(deliveryId)) return true;
+  markDelivery(deliveryId, source);
+  return false;
 }
 
 export function recordDeploy(input: RecordDeployInput) {
@@ -50,7 +69,7 @@ export function recordDeploy(input: RecordDeployInput) {
   const status = isRevert ? "skipped_revert" : "collecting";
   const prev = lastRelease.get() as { sha: string } | undefined;
   const previousSha = prev && prev.sha !== sha ? prev.sha : null;
-  const n = (telemetryCount.get(sha) as { n: number }).n;
+  const n = (telemetryCount.get(sha, sha) as { n: number }).n;
   const now = new Date().toISOString();
 
   insertDeploy.run(
@@ -68,6 +87,17 @@ export function recordDeploy(input: RecordDeployInput) {
   if (pending && isRevert) consumePending.run(now, pending.id);
 
   if (input.deliveryId) alreadyProcessed(input.deliveryId, input.source ?? "vercel");
+
+  if (isRevert && revertsSha) {
+    void import("./rollback.js")
+      .then(({ followUp }) =>
+        followUp(
+          revertsSha,
+          result("skip", sha.slice(0, 7), "ok — revert deploy recorded. not evaluated."),
+        ),
+      )
+      .catch((err) => console.error("revert follow-up", err));
+  }
 
   return { sha, skipped: false as const, origin, previous_sha: previousSha, status, request_count: n };
 }

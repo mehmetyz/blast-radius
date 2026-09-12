@@ -12,6 +12,15 @@ export const db = (() => {
   const instance = new DatabaseSync(config.databasePath);
   instance.exec("PRAGMA journal_mode = WAL");
   instance.exec(fs.readFileSync(path.join(here, "schema.sql"), "utf8"));
+  const telemetryCols = instance.prepare(`PRAGMA table_info(telemetry)`).all() as { name: string }[];
+  const names = new Set(telemetryCols.map((c) => c.name));
+  if (!names.has("error_message")) instance.exec(`ALTER TABLE telemetry ADD COLUMN error_message TEXT`);
+  if (!names.has("kind")) instance.exec(`ALTER TABLE telemetry ADD COLUMN kind TEXT NOT NULL DEFAULT 'llm'`);
+  if (!names.has("name")) instance.exec(`ALTER TABLE telemetry ADD COLUMN name TEXT`);
+  const actionCols = instance.prepare(`PRAGMA table_info(actions)`).all() as { name: string }[];
+  if (!actionCols.some((c) => c.name === "awaiting_at")) {
+    instance.exec(`ALTER TABLE actions ADD COLUMN awaiting_at TEXT`);
+  }
   return instance;
 })();
 

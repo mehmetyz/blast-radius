@@ -37,11 +37,14 @@ CREATE TABLE IF NOT EXISTS telemetry (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   sha TEXT NOT NULL,
   ts TEXT NOT NULL,
+  kind TEXT NOT NULL DEFAULT 'llm',
+  name TEXT,
   model TEXT,
   input_tokens INTEGER,
   output_tokens INTEGER,
   latency_ms INTEGER,
   error INTEGER NOT NULL DEFAULT 0,
+  error_message TEXT,
   cost_usd REAL,
   request_id TEXT
 );
@@ -85,5 +88,13 @@ CREATE TABLE IF NOT EXISTS actions (
   sheet_appended INTEGER NOT NULL DEFAULT 0,
   task_id TEXT,
   doc_id TEXT,
-  rollback_executed INTEGER NOT NULL DEFAULT 0
+  rollback_executed INTEGER NOT NULL DEFAULT 0,
+  awaiting_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS remediations (
+  sha TEXT PRIMARY KEY,
+  started_after_sha TEXT,
+  root_cause TEXT NOT NULL,
+  fix TEXT NOT NULL
 );

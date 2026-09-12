@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import type { Request, Response } from "express";
 import { config } from "../config.js";
 import { db } from "../db.js";
-import { alreadyProcessed, recordDeploy } from "../deploys.js";
+import { deliverySeen, markDelivery, recordDeploy } from "../deploys.js";
 import { markPredictionMerged, runInsight } from "../insight.js";
 
 const upsertPr = db.prepare(`
@@ -27,42 +27,25 @@ function verifySignature(raw: Buffer, header: string | undefined, secret: string
   return crypto.timingSafeEqual(a, b);
 }
 
-export function githubWebhook(req: Request, res: Response) {
-  const raw = Buffer.isBuffer(req.body) ? req.body : Buffer.from(JSON.stringify(req.body ?? {}));
-  if (!verifySignature(raw, req.get("x-hub-signature-256"), config.githubWebhookSecret)) {
-    res.status(401).json({ error: "bad signature" });
-    return;
-  }
-
-  const delivery = req.get("x-github-delivery") ?? "";
-  if (!delivery) {
-    res.status(400).json({ error: "missing x-github-delivery" });
-    return;
-  }
-  if (alreadyProcessed(delivery, "github")) {
-    res.json({ ok: true, duplicate: true });
-    return;
-  }
-
-  const event = req.get("x-github-event") ?? "";
-  const payload = JSON.parse(raw.toString("utf8")) as {
-    action?: string;
-    ref?: string;
-    after?: string;
-    head_commit?: { id?: string; message?: string };
-    deployment_status?: { state?: string };
-    deployment?: { sha?: string };
-    pull_request?: {
-      number: number;
-      title: string;
-      state: string;
-      merged?: boolean;
-      merge_commit_sha?: string | null;
-      head?: { sha: string };
-      user?: { login: string };
-    };
+type GithubPayload = {
+  action?: string;
+  ref?: string;
+  after?: string;
+  head_commit?: { id?: string; message?: string };
+  deployment_status?: { state?: string };
+  deployment?: { sha?: string };
+  pull_request?: {
+    number: number;
+    title: string;
+    state: string;
+    merged?: boolean;
+    merge_commit_sha?: string | null;
+    head?: { sha: string };
+    user?: { login: string };
   };
+};
 
+function handleGithubEvent(event: string, payload: GithubPayload): Record<string, unknown> {
   if (event === "pull_request" && payload.pull_request) {
     const pr = payload.pull_request;
     const mergedSha = pr.merged && pr.merge_commit_sha ? pr.merge_commit_sha : null;
@@ -76,14 +59,13 @@ export function githubWebhook(req: Request, res: Response) {
       new Date().toISOString(),
     );
     if (mergedSha) markPredictionMerged(pr.number, mergedSha);
-    res.json({ ok: true, pr: pr.number, action: payload.action });
     const insightActions = new Set(["opened", "synchronize", "reopened", "ready_for_review"]);
     if (insightActions.has(payload.action ?? "") && pr.head?.sha) {
       void runInsight(pr.number, pr.head.sha).catch((err) => {
         console.error("insight failed", err);
       });
     }
-    return;
+    return { ok: true, pr: pr.number, action: payload.action };
   }
 
   if (event === "push" && payload.ref && /\/(main|master)$/.test(payload.ref)) {
@@ -94,8 +76,7 @@ export function githubWebhook(req: Request, res: Response) {
         commitMessage: payload.head_commit?.message,
         source: "github",
       });
-      res.json({ ok: true, push: recorded });
-      return;
+      return { ok: true, push: recorded };
     }
   }
 
@@ -103,10 +84,38 @@ export function githubWebhook(req: Request, res: Response) {
     const sha = payload.deployment?.sha ?? "";
     if (sha) {
       const recorded = recordDeploy({ sha, source: "github" });
-      res.json({ ok: true, deployment: recorded });
-      return;
+      return { ok: true, deployment: recorded };
     }
   }
 
-  res.json({ ok: true, ignored: event });
+  return { ok: true, ignored: event };
+}
+
+export function githubWebhook(req: Request, res: Response) {
+  const raw = Buffer.isBuffer(req.body) ? req.body : Buffer.from(JSON.stringify(req.body ?? {}));
+  if (!verifySignature(raw, req.get("x-hub-signature-256"), config.githubWebhookSecret)) {
+    res.status(401).json({ error: "bad signature" });
+    return;
+  }
+
+  const delivery = req.get("x-github-delivery") ?? "";
+  if (!delivery) {
+    res.status(400).json({ error: "missing x-github-delivery" });
+    return;
+  }
+  if (deliverySeen(delivery)) {
+    res.json({ ok: true, duplicate: true });
+    return;
+  }
+
+  try {
+    const event = req.get("x-github-event") ?? "";
+    const payload = JSON.parse(raw.toString("utf8")) as GithubPayload;
+    const result = handleGithubEvent(event, payload);
+    markDelivery(delivery, "github");
+    res.json(result);
+  } catch (err) {
+    console.error("github webhook", err);
+    res.status(500).json({ error: "github handler failed" });
+  }
 }

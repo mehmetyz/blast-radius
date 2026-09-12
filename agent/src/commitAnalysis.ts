@@ -8,6 +8,7 @@ const insertCommit = db.prepare(`
     (sha, deploy_sha, baseline_sha, author_login, message, category, severity, summary, diff_blob, created_at)
   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   ON CONFLICT(sha) DO UPDATE SET
+    deploy_sha = excluded.deploy_sha,
     baseline_sha = excluded.baseline_sha,
     category = excluded.category,
     severity = excluded.severity,

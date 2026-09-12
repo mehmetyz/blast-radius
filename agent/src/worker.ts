@@ -2,30 +2,55 @@ import { config } from "./config.js";
 import { db } from "./db.js";
 import { runActiveAgent } from "./agent.js";
 import { evaluateDeploy } from "./evaluator.js";
+import { watchApprovals } from "./approval.js";
 
 const due = db.prepare(`
   SELECT sha FROM deploys
   WHERE origin = 'release' AND status = 'collecting' AND request_count >= ?
 `);
+const stale = db.prepare(`
+  SELECT d.sha FROM deploys d
+  WHERE d.origin = 'release' AND d.status = 'collecting' AND d.request_count < ?
+    AND EXISTS (
+      SELECT 1 FROM deploys n
+      WHERE n.origin = 'release' AND n.sha != d.sha AND n.deployed_at > d.deployed_at
+    )
+`);
 const claim = db.prepare(
   `INSERT OR IGNORE INTO actions (sha, poll_id, sheet_appended, task_id, doc_id, rollback_executed) VALUES (?, NULL, 0, NULL, NULL, 0)`,
 );
 const setStatus = db.prepare(`UPDATE deploys SET status = ? WHERE sha = ?`);
+const getStatus = db.prepare(`SELECT status FROM deploys WHERE sha = ?`);
+
+let ticking = false;
 
 export async function tick() {
-  const rows = due.all(config.minRequests) as { sha: string }[];
-  for (const { sha } of rows) {
-    const result = evaluateDeploy(sha);
-    if (!result || result.verdict === "ok") continue;
-    const info = claim.run(sha);
-    if (Number(info.changes) === 0) continue;
-    try {
-      await runActiveAgent(sha);
-      setStatus.run("alerted", sha);
-      console.log(`alerted ${sha.slice(0, 7)} ${result.verdict}`);
-    } catch (err) {
-      console.error(`alert failed ${sha}`, err);
+  if (ticking) return;
+  ticking = true;
+  try {
+    for (const { sha } of stale.all(config.minRequests) as { sha: string }[]) {
+      setStatus.run("insufficient_data", sha);
+      console.log(`insufficient_data ${sha.slice(0, 7)}`);
     }
+    const rows = due.all(config.minRequests) as { sha: string }[];
+    for (const { sha } of rows) {
+      const result = evaluateDeploy(sha);
+      if (!result || result.verdict === "ok") continue;
+      const info = claim.run(sha);
+      if (Number(info.changes) === 0) continue;
+      try {
+        await runActiveAgent(sha);
+      } catch (err) {
+        console.error(`alert failed ${sha}`, err);
+      }
+      const row = getStatus.get(sha) as { status: string } | undefined;
+      if (row?.status === "collecting") setStatus.run("alerted", sha);
+      const after = getStatus.get(sha) as { status: string } | undefined;
+      console.log(`${after?.status ?? "alerted"} ${sha.slice(0, 7)} ${result.verdict}`);
+    }
+    await watchApprovals();
+  } finally {
+    ticking = false;
   }
 }
 

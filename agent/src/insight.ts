@@ -1,7 +1,8 @@
 import OpenAI from "openai";
 import { config } from "./config.js";
 import { db } from "./db.js";
-import { commentOnPr, listPrFiles } from "./github.js";
+import { commentOnPr, getPull, listPrAuthors, listPrFiles } from "./github.js";
+import { formatInsightComment } from "./copy.js";
 
 const insertPrediction = db.prepare(`
   INSERT INTO predictions (
@@ -18,7 +19,14 @@ type Estimate = {
   estimated_cost_delta_pct: number;
   estimated_latency_delta_pct: number;
   rationale: string;
-  suspect_hints: unknown;
+  suspect_hints: {
+    files?: string[];
+    models?: string[];
+    params?: string[];
+    endpoints?: string[];
+    functions?: string[];
+    error_risk?: string;
+  };
 };
 
 export function markPredictionMerged(prNumber: number, mergedSha: string) {
@@ -26,7 +34,7 @@ export function markPredictionMerged(prNumber: number, mergedSha: string) {
 }
 
 export async function runInsight(prNumber: number, headSha: string) {
-  const files = await listPrFiles(prNumber);
+  const [files, authors] = await Promise.all([listPrFiles(prNumber), listPrAuthors(prNumber)]);
   const diff = files
     .map((f) => `--- ${f.filename} (${f.status})\n${f.patch ?? ""}`)
     .join("\n\n")
@@ -40,41 +48,67 @@ export async function runInsight(prNumber: number, headSha: string) {
     timeout: 30_000,
   });
 
-  const completion = await client.chat.completions.create({
-    model: config.llmModel,
-    response_format: { type: "json_object" },
-    messages: [
-      {
-        role: "system",
-        content: `You estimate production LLM cost and latency impact of a git diff.
+  const ask = () =>
+    client.chat.completions.create({
+      model: config.llmModel,
+      response_format: { type: "json_object" },
+      messages: [
+        {
+          role: "system",
+          content: `You estimate production impact of a git diff: LLM cost, endpoint/function latency, and error risk.
 Return JSON only:
-{"estimated_cost_delta_pct": number, "estimated_latency_delta_pct": number, "rationale": string, "suspect_hints": {"files": string[], "models": string[], "params": string[]}}
-Focus on gen_ai changes: model swaps, max_tokens, temperature, extra round-trips, larger prompts.
-If the diff does not touch LLM calls, return zeros and say so. Percent is vs current production (negative means cheaper/faster).`,
-      },
-      { role: "user", content: diff || "(empty diff)" },
-    ],
-  });
+{"estimated_cost_delta_pct": number, "estimated_latency_delta_pct": number, "rationale": string, "suspect_hints": {"files": string[], "models": string[], "params": string[], "endpoints": string[], "functions": string[], "error_risk": string}}
+Look at: model/token/prompt changes; new or heavier HTTP routes; new or hotter functions; retries; missing env; breaking API changes.
+If there is error risk, put a short sentence in error_risk. If the diff is a no-op for runtime, return zeros and say so.
+Percent is vs current production (negative = cheaper/faster).`,
+        },
+        { role: "user", content: diff || "(empty diff)" },
+      ],
+    });
 
-  const raw = completion.choices[0]?.message?.content ?? "{}";
-  const parsed = JSON.parse(raw) as Estimate;
+  let parsed: Estimate;
+  try {
+    parsed = JSON.parse((await ask()).choices[0]?.message?.content ?? "{}") as Estimate;
+  } catch (first) {
+    console.error("insight llm retry", first);
+    parsed = JSON.parse((await ask()).choices[0]?.message?.content ?? "{}") as Estimate;
+  }
   const cost = Number(parsed.estimated_cost_delta_pct) || 0;
   const latency = Number(parsed.estimated_latency_delta_pct) || 0;
   const rationale = String(parsed.rationale ?? "").slice(0, 4000);
-  const hints = JSON.stringify(parsed.suspect_hints ?? {});
+  const hints = {
+    ...(typeof parsed.suspect_hints === "object" && parsed.suspect_hints ? parsed.suspect_hints : {}),
+    authors,
+  };
+  insertPrediction.run(prNumber, headSha, cost, latency, rationale, JSON.stringify(hints));
 
-  insertPrediction.run(prNumber, headSha, cost, latency, rationale, hints);
-
-  const sign = (n: number) => (n > 0 ? `+${n}` : `${n}`);
-  const body = `## Blast Radius INSIGHT
-
-Predicted cost: **${sign(cost)}%**
-Predicted latency: **${sign(latency)}%**
-
-${rationale}
-
-This estimate will be scored against real telemetry after deploy (\`predicted X, actual Y\`).
-`;
+  const endpoints = hints.endpoints?.filter(Boolean) ?? [];
+  const functions = hints.functions?.filter(Boolean) ?? [];
+  const touches = [...endpoints, ...functions.map((f) => `\`${f}\``)];
+  let title: string | undefined;
+  let head: string | undefined;
+  let base: string | undefined;
+  try {
+    const pr = await getPull(prNumber);
+    title = pr.title;
+    head = pr.head;
+    base = pr.base;
+  } catch {
+    // comment still works without branch names
+  }
+  const body = formatInsightComment({
+    prNumber,
+    sha: headSha,
+    costPct: cost,
+    latencyPct: latency,
+    errorRisk: hints.error_risk,
+    touches,
+    authors,
+    rationale,
+    title,
+    head,
+    base,
+  });
   await commentOnPr(prNumber, body);
-  console.log(`insight: PR #${prNumber} cost ${sign(cost)}% latency ${sign(latency)}%`);
+  console.log(`insight: PR #${prNumber} cost ${cost}% latency ${latency}% authors=${authors.length}`);
 }

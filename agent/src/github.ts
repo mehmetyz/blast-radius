@@ -61,6 +61,16 @@ export async function listPrAuthors(pr: number): Promise<string[]> {
   return [...seen];
 }
 
+export async function commitFiles(
+  sha: string,
+): Promise<{ filename: string; status: string; patch?: string }[]> {
+  const { owner, name } = repo();
+  const res = await github<{ files?: { filename: string; status: string; patch?: string }[] }>(
+    `/repos/${owner}/${name}/commits/${sha}`,
+  );
+  return res.files ?? [];
+}
+
 export async function githubCompare(base: string, head: string) {
   const { owner, name } = repo();
   return github<{

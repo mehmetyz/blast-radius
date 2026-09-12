@@ -1,5 +1,6 @@
 import { config } from "./config.js";
 import { cmd } from "./cmd.js";
+import type { CommitClassification } from "./commitAnalysis.js";
 
 export const LEDGER_TITLE = "Blast Radius — Deploy Ledger";
 export const LEDGER_TITLES = [
@@ -79,9 +80,29 @@ export function trimDiff(patch: string, maxLines = 20): string {
   return lines.slice(0, maxLines).join("\n").trim() + `\n... (${lines.length - maxLines} more lines)`;
 }
 
+export function sliceHunk(rawPatch: string, lineRange: string): string | undefined {
+  const [startStr] = lineRange.split(/[-,]/);
+  const start = Number(startStr);
+  if (!Number.isFinite(start)) return undefined;
+  const hunks = rawPatch.split(/(?=^@@)/m);
+  let best: { hunk: string; distance: number } | undefined;
+  for (const hunk of hunks) {
+    const m = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))?/.exec(hunk);
+    if (!m) continue;
+    const hStart = Number(m[1]);
+    const hLen = Number(m[2] ?? 1);
+    const hEnd = hStart + hLen - 1;
+    if (start >= hStart && start <= hEnd) return hunk.trim();
+    const distance = Math.min(Math.abs(start - hStart), Math.abs(start - hEnd));
+    if (!best || distance < best.distance) best = { hunk: hunk.trim(), distance };
+  }
+  return best?.hunk;
+}
+
 export type CopySuspect = {
   rank: number;
   pr_number?: number | null;
+  commit_sha?: string | null;
   author_login?: string | null;
   confidence: number;
   reason: string;
@@ -133,6 +154,9 @@ export type CopyInput = {
   resolvedAt?: string | null;
   revertSha?: string | null;
   predictionErrorPp?: number | null;
+  errorLog?: { message: string; count: number }[];
+  errorPairs?: { error: string; commit_sha: string | null; message: string; author: string | null }[];
+  commitAnalysis?: CommitClassification[];
 };
 
 export function shortSha(sha: string): string {
@@ -278,8 +302,13 @@ function primaryChange(input: CopyInput): CopyChange | undefined {
   return input.changes?.[0];
 }
 
+function isMergeOrRevert(message: string): boolean {
+  return /^(Merge( pull request)? |Revert )/i.test(message.trim());
+}
+
 function primaryCommit(input: CopyInput): CopyCommit | undefined {
-  return input.commits?.[input.commits.length - 1] ?? input.commits?.[0];
+  const commits = (input.commits ?? []).filter((c) => !isMergeOrRevert(c.message));
+  return commits[0] ?? input.commits?.[0];
 }
 
 export function verdictLabel(verdict: string): string {
@@ -354,14 +383,10 @@ function alertImpactLines(input: CopyInput): string[] {
   const n = input.current.n;
   const base7 = input.baseline_sha ? `\`${shortSha(input.baseline_sha)}\`` : "the last release";
   if (input.verdict === "error_spike") {
+    // Single responsibility: the error alert speaks only about errors.
     const failed = Math.round(input.current.error_rate * n);
-    const costDrop = pct(input.actual_cost_delta_pct);
-    const latDrop = pct(input.actual_latency_delta_pct);
     return [
       `**Errors ${errPct(input.baseline.error_rate)} → ${errPct(input.current.error_rate)}** (${failed} of ${n} requests failed)`,
-      `Cost **${costDrop}** · latency **${latDrop}** · baseline ${base7}`,
-      "",
-      "Failed requests short-circuit before reaching the LLM — that's why cost and latency dropped.",
     ];
   }
   if (input.verdict === "latency_regression") {
@@ -403,14 +428,27 @@ function changesBlock(input: CopyInput): string[] {
 }
 
 function suspectsBlock(input: CopyInput): string[] {
-  const change = primaryChange(input);
+  // Error alerts speak through the evidence-backed suspect; other verdicts use the PR line.
+  const change = input.verdict === "error_spike" ? undefined : primaryChange(input);
   const commit = primaryCommit(input);
+  const top = input.suspects[0];
   const lines: string[] = ["**Suspects**", ""];
   if (change) {
     const author = at(change.author);
     const commitBit = commit ? ` · commit \`${shortSha(commit.sha)}\`` : "";
     lines.push(`**${prLink(change.pr_number, change.title)}** by ${author}${commitBit}`);
     if (commit?.message) lines.push(`> ${subject(commit.message)}`);
+  } else if (top?.reason) {
+    lines.push(`${at(top.author_login)} — ${sentence(top.reason)}`);
+    if (top.commit_sha) {
+      const linked = (input.commits ?? []).find(
+        (c) => c.sha.slice(0, 7) === top.commit_sha!.slice(0, 7),
+      );
+      const msg = linked?.message ? ` · ${linked.message.split("\n")[0]!.slice(0, 60)}` : "";
+      lines.push(`Commit \`${shortSha(top.commit_sha)}\`${msg}`);
+    }
+    const conf = Math.round((top.confidence ?? 0) * 100);
+    lines.push(`Confidence ${conf}%${!top.commit_sha && commit ? ` · first commit \`${shortSha(commit.sha)}\`` : ""}`);
   } else if (commit) {
     lines.push(`Commit \`${shortSha(commit.sha)}\` by ${at(commit.author)}`);
     if (commit.message) lines.push(`> ${subject(commit.message)}`);
@@ -418,7 +456,7 @@ function suspectsBlock(input: CopyInput): string[] {
     const people = whoCompact(input);
     lines.push(people || "No PR or commit yet — compare still loading.");
   }
-  const chg = changesBlock(input);
+  const chg = input.commitAnalysis?.length ? [] : changesBlock(input);
   if (chg.length) {
     lines.push("");
     lines.push(...chg);
@@ -426,29 +464,130 @@ function suspectsBlock(input: CopyInput): string[] {
   return lines;
 }
 
-function awaitingHumanBlock(sha: string, previousSha?: string | null): string[] {
-  const sha7 = shortSha(sha);
-  const prev = previousSha ? `\`${shortSha(previousSha)}\`` : "the previous release";
+const COMMIT_CATEGORY_EMOJI: Record<string, string> = {
+  cost: "🔴",
+  latency: "🟡",
+  errors: "🚨",
+  prompt: "🟠",
+  dataflow: "🔵",
+  docs: "⚪",
+  refactor: "⚪",
+};
+
+function commitCategoryLabel(cat: string): string {
+  if (cat === "cost") return "Cost";
+  if (cat === "latency") return "Latency";
+  if (cat === "errors") return "Errors";
+  if (cat === "prompt") return "Prompt";
+  if (cat === "dataflow") return "Data-flow";
+  if (cat === "docs") return "Docs";
+  return "Refactor";
+}
+
+const RELEVANT_CATEGORIES: Record<string, string[]> = {
+  error_spike: ["errors", "dataflow"],
+  cost_regression: ["cost", "prompt", "dataflow"],
+  latency_regression: ["latency", "dataflow"],
+};
+
+export function relevantCategories(verdict: string): string[] {
+  return RELEVANT_CATEGORIES[verdict] ?? ["cost", "latency", "errors", "prompt", "dataflow"];
+}
+
+function cell(text: string): string {
+  return text.replace(/\|/g, "\\|");
+}
+
+function commitsBlock(input: CopyInput): string[] {
+  // Only the commits that can plausibly explain this verdict — not the whole deploy.
+  const relevant = relevantCategories(input.verdict);
+  const commits = (input.commitAnalysis ?? []).filter((c) => relevant.includes(c.category));
+  const pairs = input.errorPairs ?? [];
+  if (!commits.length && !pairs.length) return [];
+  const suspectShas = new Set(
+    (input.suspects ?? [])
+      .map((s) => s.commit_sha?.slice(0, 7))
+      .filter((s): s is string => Boolean(s)),
+  );
+  const mark = (sha: string, text: string) =>
+    `${text}${suspectShas.has(sha.slice(0, 7)) ? " ← suspect" : ""}`;
+
+  const header =
+    input.verdict === "error_spike"
+      ? ["Error", "Commit", "Message", "Author"]
+      : ["Commit", "Message", "Impact", "Author"];
+  const rows: string[][] = [];
+
+  if (input.verdict === "error_spike") {
+    const used = new Set<string>();
+    for (const p of pairs) {
+      const key = p.commit_sha ? p.commit_sha.slice(0, 7) : "";
+      if (key) used.add(key);
+      const err = p.error.length > 46 ? `${p.error.slice(0, 46)}…` : p.error;
+      rows.push([
+        cell(`\`"${err}"\``),
+        p.commit_sha ? `\`${shortSha(p.commit_sha)}\`` : "—",
+        cell(mark(p.commit_sha ?? "", p.message.split("\n")[0]!.slice(0, 45) || "—")),
+        p.author ? `@${p.author}` : "—",
+      ]);
+    }
+    for (const c of commits) {
+      if (used.has(c.sha.slice(0, 7))) continue;
+      rows.push([
+        "—",
+        `\`${shortSha(c.sha)}\``,
+        cell(mark(c.sha, c.message.split("\n")[0]!.slice(0, 45))),
+        c.author_login ? `@${c.author_login}` : "—",
+      ]);
+    }
+  } else {
+    for (const c of commits) {
+      const emoji = COMMIT_CATEGORY_EMOJI[c.category] ?? "⚪";
+      const label = commitCategoryLabel(c.category);
+      const sev = c.severity === "high" ? "high" : c.severity === "medium" ? "med" : "low";
+      rows.push([
+        `\`${shortSha(c.sha)}\``,
+        cell(mark(c.sha, c.message.split("\n")[0]!.slice(0, 45))),
+        `${emoji} ${label} (${sev})`,
+        c.author_login ? `@${c.author_login}` : "—",
+      ]);
+    }
+  }
+
   return [
-    "**Reply in this channel:**",
-    `- \`${cmd("rollback", sha7)}\` — revert to ${prev}`,
-    `- \`${cmd("keep", sha7)}\` — accept and keep watching`,
-    `- \`${cmd("status", sha7)}\` — fresh numbers`,
+    "**Suspicious commits**",
     "",
-    "Nothing rolls back until you say so.",
+    `| ${header.join(" | ")} |`,
+    `| ${header.map(() => "---").join(" | ")} |`,
+    ...rows.map((r) => `| ${r.join(" | ")} |`),
   ];
+}
+
+function awaitingHumanBlock(input: CopyInput): string[] {
+  const sha7 = shortSha(input.sha);
+  const lines = ["**Reply in this channel:**"];
+  // Rollback targets a COMMIT — the user picks one from the table above.
+  lines.push(`- \`${cmd("rollback", "<commit-id>")}\` — pick a commit from the table above`);
+  lines.push(`- \`${cmd("keep", sha7)}\` — accept and keep watching`);
+  lines.push(`- \`${cmd("status", sha7)}\` — fresh numbers`);
+  lines.push("");
+  lines.push("Nothing rolls back until you say so.");
+  return lines;
 }
 
 export function formatRegressionAlert(input: CopyInput): string {
   const sha7 = shortSha(input.sha);
+  const repo = config.githubRepo ? ` · ${config.githubRepo}` : "";
   const lines = [
-    `${alertMark(input.verdict)} **${verdictLabel(input.verdict)}** · \`${sha7}\``,
+    `${alertMark(input.verdict)} **${verdictLabel(input.verdict)}** · deploy \`${sha7}\`${repo}`,
     "",
     ...alertImpactLines(input),
     "",
     ...suspectsBlock(input),
     "",
-    ...awaitingHumanBlock(input.sha, input.baseline_sha ?? input.previousSha),
+    ...commitsBlock(input),
+    "",
+    ...awaitingHumanBlock(input),
   ];
   return tidy(lines);
 }
@@ -463,7 +602,7 @@ export function formatPostmortem(input: CopyInput & { outcome: string }): string
     resolvedDate.toISOString().slice(0, 10) === detectedDate.toISOString().slice(0, 10)
       ? `${resolvedDate.toISOString().slice(11, 16)} UTC`
       : `${utcStamp(resolvedDate, false)} UTC`;
-  const pr = change ? `#${change.pr_number}` : "—";
+  const pr = change ? prLink(change.pr_number) : "—";
   const author = change?.author ? at(change.author) : whoCompact(input) || "unknown";
 
   const lines = [
@@ -521,7 +660,8 @@ export type LedgerFacts = {
 function costCell(n: number): string {
   if (!Number.isFinite(n)) return "";
   if (Math.abs(n) >= 1) return n.toFixed(2);
-  return n.toFixed(4);
+  if (Math.abs(n) >= 0.01) return n.toFixed(4);
+  return n.toFixed(6).replace(/0+$/, "").replace(/\.$/, "");
 }
 
 export function dominantModel(slice?: CopySlice): string {
@@ -557,7 +697,7 @@ export function formatLedgerFacts(f: LedgerFacts): string[] {
     f.errorRate != null && Number.isFinite(f.errorRate) ? errPct(f.errorRate) : "",
     f.verdict || "",
     f.predicted != null && Number.isFinite(f.predicted) ? pct(f.predicted) : "",
-    f.errorPp != null && Number.isFinite(f.errorPp) ? String(Math.round(f.errorPp)) : "",
+    f.errorPp != null && Number.isFinite(f.errorPp) ? f.errorPp.toFixed(1) : "",
     ledgerOutcome(f.outcome),
     f.baseline ? shortSha(f.baseline) : "",
   ];
@@ -680,7 +820,9 @@ function rootCauseLine(input: CopyInput): string {
   }
   if (model) bits.push(`model ${model}`);
   if (commit) bits.push(`\`${shortSha(commit.sha)}\` ${subject(commit.message)}`);
-  if (input.rootCause) bits.push(sentence(input.rootCause));
+  // Remediation text only belongs to error postmortems — for cost/latency verdicts
+  // it is stale data from an earlier error round.
+  if (input.verdict === "error_spike" && input.rootCause) bits.push(sentence(input.rootCause));
   return bits.join(" — ") || "No single file stood out in the compare.";
 }
 
@@ -741,6 +883,82 @@ function actionItems(input: CopyInput): string[] {
   return [`- [ ] Block unreviewed production model bumps — ${owner}`];
 }
 
+export type InsightImpact = "cost" | "latency" | "errors" | "prompt" | "dataflow" | "docs";
+export type InsightSeverity = "high" | "medium" | "low";
+
+export type InsightHunk = {
+  file: string;
+  lineRange: string;
+  impacts: InsightImpact[];
+  severity: InsightSeverity;
+  summary: string;
+  diff?: string;
+  detail?: string;
+};
+
+const IMPACT_LABEL: Record<InsightImpact, string> = {
+  cost: "Cost",
+  latency: "Latency",
+  errors: "Errors",
+  prompt: "Prompt",
+  dataflow: "Data-flow",
+  docs: "Docs",
+};
+
+function severityEmoji(sev: InsightSeverity): string {
+  if (sev === "high") return "🔴";
+  if (sev === "medium") return "🟡";
+  return "🟢";
+}
+
+function impactLabels(impacts: InsightImpact[]): string {
+  if (!impacts.length) return "Change";
+  return impacts.map((i) => IMPACT_LABEL[i]).join(" + ");
+}
+
+function hunksTable(hunks: InsightHunk[]): string[] {
+  if (!hunks.length) return [];
+  const rows = ["| File · line | Impact | What |", "|---|---|---|"];
+  for (const h of hunks) {
+    const impact = `${severityEmoji(h.severity)} ${impactLabels(h.impacts)}`;
+    const what = h.summary.replace(/\|/g, "\\|").slice(0, 240);
+    rows.push(`| \`${h.file}:${h.lineRange}\` | ${impact} | ${what} |`);
+  }
+  return rows;
+}
+
+function hunksSummarySentence(hunks: InsightHunk[]): string {
+  const filesCount = new Set(hunks.map((h) => h.file)).size;
+  return `${hunks.length} hunk${hunks.length === 1 ? "" : "s"} across ${filesCount} file${filesCount === 1 ? "" : "s"}`;
+}
+
+function hunksByFile(hunks: InsightHunk[]): Map<string, InsightHunk[]> {
+  const map = new Map<string, InsightHunk[]>();
+  for (const h of hunks) {
+    const existing = map.get(h.file) ?? [];
+    existing.push(h);
+    map.set(h.file, existing);
+  }
+  return map;
+}
+
+function hunksDetailedBlock(hunks: InsightHunk[]): string[] {
+  if (!hunks.length) return [];
+  const lines: string[] = ["### Details"];
+  for (const [file, fileHunks] of hunksByFile(hunks)) {
+    lines.push("", `**\`${file}\`** — ${fileHunks.length} hunk${fileHunks.length === 1 ? "" : "s"}`);
+    for (const h of fileHunks) {
+      lines.push("", `**Line ${h.lineRange} — ${severityEmoji(h.severity)} ${impactLabels(h.impacts)} — ${h.summary}**`);
+      const snippet = h.diff ? sliceHunk(h.diff, h.lineRange) ?? h.diff : undefined;
+      if (snippet) {
+        lines.push("```diff", trimDiff(snippet, 14), "```");
+      }
+      if (h.detail) lines.push(sentence(h.detail));
+    }
+  }
+  return lines;
+}
+
 export type InsightCommentInput = {
   prNumber: number;
   sha: string;
@@ -758,14 +976,8 @@ export type InsightCommentInput = {
   head?: string;
   base?: string;
   primaryPatch?: { filename: string; rawPatch?: string };
+  hunks?: InsightHunk[];
 };
-
-function riskEmoji(magnitude: "high" | "medium" | "low" | "none"): string {
-  if (magnitude === "high") return "🔴";
-  if (magnitude === "medium") return "🟡";
-  if (magnitude === "low") return "🟢";
-  return "⚪";
-}
 
 function costRisk(pctVal: number): "high" | "medium" | "low" {
   const abs = Math.abs(pctVal);
@@ -774,11 +986,20 @@ function costRisk(pctVal: number): "high" | "medium" | "low" {
   return "low";
 }
 
-function latencyRisk(pctVal: number): "high" | "medium" | "low" {
-  const abs = Math.abs(pctVal);
-  if (abs >= 50) return "high";
-  if (abs >= 15) return "medium";
-  return "low";
+function fallbackHunk(input: InsightCommentInput): InsightHunk | null {
+  const p = input.primaryPatch;
+  if (!p?.rawPatch) return null;
+  const errors = input.errorRisks ?? [];
+  const impacts: InsightImpact[] = ["cost"];
+  if (errors.length) impacts.push("errors");
+  return {
+    file: p.filename,
+    lineRange: "?",
+    impacts,
+    severity: input.costPct < 0 ? "low" : costRisk(input.costPct),
+    summary: input.costWhy || `Cost delta ${pct(input.costPct)}`,
+    diff: p.rawPatch,
+  };
 }
 
 export function formatInsightComment(input: InsightCommentInput): string {
@@ -790,50 +1011,32 @@ export function formatInsightComment(input: InsightCommentInput): string {
     : input.errorRisk
       ? [input.errorRisk.replace(/^error risk\s+/i, "")]
       : [];
-  const endpoints = input.endpointRisks ?? [];
-  const prompts = input.promptRisks ?? [];
-
-  const errorMag = errors.length ? "high" : "low";
-  const promptMag = prompts.length ? "medium" : "low";
+  const hunks = input.hunks?.length ? input.hunks : ([fallbackHunk(input)].filter(Boolean) as InsightHunk[]);
 
   const lines: string[] = [
-    `🔍 **INSIGHT** · pre-merge analysis of \`${sha7}\` · ${prLink(input.prNumber, input.title)}${branch}`,
+    `## 🔍 INSIGHT — pre-merge analysis of \`${sha7}\` · ${prLink(input.prNumber, input.title)}${branch}`,
     "",
-    `**Expected cost:** **${pct(input.costPct)}** per request (deterministic, from price table)`,
-    `**Expected latency:** ${pct(input.latencyPct)} (LLM class estimate)`,
-    `**Expected errors:** ${errors.length ? "increase likely — see below" : "unchanged"}`,
+    `**Predicted impact:** cost **${pct(input.costPct)}** · latency **${pct(input.latencyPct)}** · errors **${errors.length ? "increase likely" : "unchanged"}**`,
+    "",
+    "Deterministic parts (cost, model) come from the price table. Qualitative parts (latency, errors, prompt) come from LLM analysis of the diff.",
   ];
 
-  if (input.primaryPatch?.rawPatch) {
-    lines.push(
-      "",
-      `**Changes** — \`${input.primaryPatch.filename}\``,
-      "```diff",
-      trimDiff(input.primaryPatch.rawPatch, 18),
-      "```",
-    );
+  if (hunks.length) {
+    lines.push("", `### Summary — ${hunksSummarySentence(hunks)}`, "", ...hunksTable(hunks));
+    lines.push("", ...hunksDetailedBlock(hunks));
   }
 
-  lines.push("", "**Risk flags**");
-  lines.push(
-    `- ${riskEmoji(costRisk(input.costPct))} **Cost** — ${input.costWhy ? sentence(input.costWhy) : `${pct(input.costPct)} per request from price table.`}`,
-  );
-  lines.push(
-    `- ${riskEmoji(latencyRisk(input.latencyPct))} **Latency** — ${
-      endpoints.length ? endpoints.map((r) => sentence(r)).join(" ") : `${pct(input.latencyPct)} estimated.`
-    }`,
-  );
-  lines.push(
-    `- ${riskEmoji(errorMag)} **Errors** — ${errors.length ? errors.map((r) => sentence(r)).join(" ") : "no new failure paths detected."}`,
-  );
-  if (prompts.length) {
-    lines.push(`- ${riskEmoji(promptMag)} **Prompt** — ${prompts.map((r) => sentence(r)).join(" ")}`);
+  if (input.rationale.trim()) {
+    lines.push("", "### Rationale", input.rationale.trim());
   }
-
   if (input.touches.length) lines.push("", `Touches ${input.touches.join(", ")}.`);
   if (input.authors.length) lines.push(input.authors.map((a) => at(a)).join("  "));
-  if (input.rationale.trim()) lines.push("", input.rationale.trim());
-  lines.push("", "I'll score this prediction against live traffic after merge.");
+  lines.push(
+    "",
+    "---",
+    "",
+    "After merge, I'll score cost against live traffic (deterministic) and re-evaluate latency and error rate once enough requests come in. If any threshold breaches, I'll post to `#blast-radius`.",
+  );
   return tidy(lines);
 }
 
@@ -843,17 +1046,33 @@ export function formatInsightChannel(input: {
   costPct: number;
   latencyPct: number;
   title?: string;
+  authorLogin?: string;
   errorRisks?: string[];
   endpointRisks?: string[];
+  hunks?: InsightHunk[];
 }): string {
   const sha7 = shortSha(input.sha);
-  const risk = input.errorRisks?.[0] || input.endpointRisks?.[0];
-  return tidy([
-    `🔍 **INSIGHT** · \`${sha7}\` · ${prLink(input.prNumber, input.title)}`,
-    `Deterministic cost **${pct(input.costPct)}**. Latency estimate **${pct(input.latencyPct)}**.`,
-    risk ? sentence(risk) : "",
-    "PR comment has the three-tier breakdown. I will score cost against live traffic after merge.",
-  ]);
+  const errors = input.errorRisks ?? [];
+  const author = input.authorLogin ? ` by ${at(input.authorLogin)}` : "";
+  const errorsLabel = errors.length ? "increase likely" : "unchanged";
+  const repo = config.githubRepo ? ` · ${config.githubRepo}` : "";
+
+  const lines: string[] = [
+    `🔍 **INSIGHT** · pre-merge · \`${sha7}\` · ${prLink(input.prNumber, input.title)}${author}${repo}`,
+    "",
+    `**Expected impact:** cost **${pct(input.costPct)}** · latency **${pct(input.latencyPct)}** · errors **${errorsLabel}**`,
+  ];
+
+  const hunks = input.hunks ?? [];
+  if (hunks.length) {
+    lines.push("", `**Changes** — ${hunksSummarySentence(hunks)}`, "", ...hunksTable(hunks));
+  }
+
+  lines.push(
+    "",
+    `Full breakdown in the [PR comment](${prHref(input.prNumber)}). I'll score against live traffic after merge.`,
+  );
+  return tidy(lines);
 }
 
 export function decisionLine(outcome: string, sha7: string, input?: CopyInput): string {
@@ -914,11 +1133,34 @@ export function formatRollbackReply(
   ]);
 }
 
+export type EvalHistoryRow = {
+  verdict: string;
+  actual_cost_delta_pct: number | null;
+  actual_latency_delta_pct: number | null;
+  error_rate_delta: number | null;
+  created_at: string;
+};
+
+export function formatEvalHistory(rows: EvalHistoryRow[]): string {
+  if (!rows.length) return "";
+  const lines = rows.map((r) => {
+    const head =
+      r.verdict === "error_spike"
+        ? `errors ${errPct(r.error_rate_delta ?? 0)}`
+        : r.verdict === "cost_regression"
+          ? `cost ${pct(r.actual_cost_delta_pct ?? 0)}`
+          : `latency ${pct(r.actual_latency_delta_pct ?? 0)}`;
+    return `- ${alertMark(r.verdict)} **${verdictLabel(r.verdict)}** — ${head} · ${utcStamp(r.created_at, false)} UTC`;
+  });
+  return tidy(["**Evaluation history**", "", ...lines]);
+}
+
 export function formatStatusReply(sha: string, input: CopyInput | null, fallback: string): string {
   if (!input) return tidy([sentence(fallback)]);
   const sha7 = shortSha(sha);
+  const repo = config.githubRepo ? ` · ${config.githubRepo}` : "";
   return tidy([
-    `${alertMark(input.verdict)} **${verdictLabel(input.verdict)}** · \`${sha7}\``,
+    `${alertMark(input.verdict)} **${verdictLabel(input.verdict)}** · deploy \`${sha7}\`${repo}`,
     "",
     ...alertImpactLines(input),
   ]);

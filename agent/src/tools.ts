@@ -11,7 +11,7 @@ const prForSha = db.prepare(
 );
 const clearSuspects = db.prepare(`DELETE FROM suspects WHERE sha = ?`);
 const insertSuspect = db.prepare(
-  `INSERT INTO suspects (sha, rank, pr_number, author_login, confidence, reason) VALUES (?, ?, ?, ?, ?, ?)`,
+  `INSERT INTO suspects (sha, rank, pr_number, commit_sha, author_login, confidence, reason) VALUES (?, ?, ?, ?, ?, ?, ?)`,
 );
 const upsertFix = db.prepare(
   `INSERT INTO remediations (sha, started_after_sha, root_cause, fix) VALUES (?, ?, ?, ?)
@@ -82,6 +82,7 @@ export const toolSpecs = [
               properties: {
                 rank: { type: "number" },
                 pr_number: { type: "number" },
+                commit_sha: { type: "string" },
                 author_login: { type: "string" },
                 confidence: { type: "number" },
                 reason: { type: "string" },
@@ -169,13 +170,22 @@ export async function executeTool(name: string, args: Record<string, unknown>): 
       const suspects = (args.suspects as Array<{
         rank: number;
         pr_number?: number;
+        commit_sha?: string;
         author_login?: string;
         confidence: number;
         reason: string;
       }>) ?? [];
       clearSuspects.run(sha);
       for (const s of suspects) {
-        insertSuspect.run(sha, s.rank, s.pr_number ?? null, s.author_login ?? null, s.confidence, s.reason);
+        insertSuspect.run(
+          sha,
+          s.rank,
+          s.pr_number ?? null,
+          s.commit_sha ? String(s.commit_sha).slice(0, 40) : null,
+          s.author_login ?? null,
+          s.confidence,
+          s.reason,
+        );
       }
       return JSON.stringify({ ok: true, n: suspects.length });
     }

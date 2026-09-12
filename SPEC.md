@@ -1,0 +1,195 @@
+# Blast Radius — Technical Spec
+
+AI agent that **owns** a bad LLM deploy: estimate impact on the PR, verify that estimate after deploy, alert in Ambiguous, wait for a human, then rollback / task / ledger / postmortem.
+
+Heart of the product: **INSIGHT prediction is scored against ACTIVE telemetry.** Example: `predicted +240% cost, actual +238%`. Without INSIGHT there is no bridge.
+
+## Stack
+
+- TypeScript, Node 22+ (local 26 is fine), Express, SQLite via built-in `node:sqlite`, OpenAI tool calling
+- This repo: `/agent` (webhook + ingest + worker). Run locally; **Dockerfile** is the deploy artifact (no Fly.io).
+- Demo: separate repo `blast-radius-demo` (Next.js 15 on Vercel). **All production-shaped telemetry comes from this app**, driven by `seed-traffic.js` (20+ real requests per deploy).
+- Telemetry field names: `service.version`, `gen_ai.request.model`, `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens` (+ `latency_ms`, optional `error`)
+- `service.version` **is the git SHA**. That is the join key everywhere, including Ambiguous `thread_key`.
+
+## Data model (SQLite)
+
+**processed_events** — webhook idempotency
+- `delivery_id` TEXT PK
+- `source` TEXT (`github` | `vercel` | `ingest`)
+- `received_at` TEXT
+
+**deploys**
+- `sha` TEXT PK
+- `previous_sha` TEXT
+- `deployed_at` TEXT
+- `origin` TEXT: `release` | `revert` (default `release`)
+- `reverts_sha` TEXT NULL — SHA this deploy rolled back, when `origin=revert`
+- `status` TEXT: `collecting` | `evaluated_ok` | `alerted` | `awaiting_approval` | `rolled_back` | `monitoring` | `insufficient_data` | `skipped_revert`
+- `request_count` INTEGER DEFAULT 0
+- `vercel_deployment_id` TEXT
+- `github_compare_url` TEXT
+
+**pending_reverts** — written by `execute_rollback` before the new SHA exists
+- `id` INTEGER PK
+- `rolled_back_sha` TEXT
+- `created_at` TEXT
+- `consumed_at` TEXT NULL
+
+**telemetry**
+- `id` INTEGER PK
+- `sha` TEXT (`service.version`)
+- `ts` TEXT
+- `model` TEXT
+- `input_tokens` INTEGER
+- `output_tokens` INTEGER
+- `latency_ms` INTEGER
+- `error` INTEGER (0/1)
+- `cost_usd` REAL (from static price table)
+- `request_id` TEXT
+
+**predictions** (INSIGHT) — required for the ACTIVE bridge
+- `id` INTEGER PK
+- `pr_number` INTEGER
+- `head_sha` TEXT
+- `merged_sha` TEXT (filled on merge)
+- `estimated_cost_delta_pct` REAL
+- `estimated_latency_delta_pct` REAL
+- `rationale` TEXT
+- `suspect_hints` TEXT (JSON: files/models/params changed)
+
+**evaluations**
+- `sha` TEXT PK
+- `baseline_sha` TEXT
+- `actual_cost_delta_pct` REAL
+- `actual_latency_delta_pct` REAL
+- `error_rate_delta` REAL
+- `predicted_cost_delta_pct` REAL NULL
+- `prediction_error_pp` REAL NULL
+- `verdict` TEXT: `ok` | `cost_regression` | `latency_regression` | `error_spike`
+- `summary` TEXT
+
+**suspects**
+- `id` INTEGER PK
+- `sha` TEXT
+- `rank` INTEGER
+- `pr_number` INTEGER
+- `author_login` TEXT
+- `confidence` REAL
+- `reason` TEXT
+
+**actions** — Ambiguous side effects; one row per deploy max for the alert
+- `sha` TEXT UNIQUE
+- `poll_id` TEXT
+- `sheet_appended` INTEGER
+- `task_id` TEXT
+- `doc_id` TEXT
+- `rollback_executed` INTEGER DEFAULT 0
+
+Constants: `MIN_REQUESTS=20`. No evaluation below that. Cost/latency regression default `+20%` vs previous **release** deploy with ≥20 requests. Error spike: error rate `≥5%` and `≥2x` baseline.
+
+## Revert loop (do not evaluate our own rollback)
+
+`git revert` + push (or Vercel rollback) creates a new deploy. If the worker treats it as a normal release, it may alert on the rollback itself.
+
+Rules:
+- `execute_rollback` inserts `pending_reverts(rolled_back_sha)` **before** the git/Vercel call.
+- On deploy insert: if the commit subject starts with `Revert`, or a pending revert matches, set `origin=revert`, `reverts_sha`, `status=skipped_revert`, consume the pending row. Never enqueue evaluation.
+- Vercel rollback to an **existing** SHA: PK collision, no new row, no re-eval.
+- Baseline for a later real release skips revert deploys (previous **release** SHA only).
+- Post in the original `thread_key` of `reverts_sha`: rollback deploy recorded, not evaluated.
+
+## Agent tools
+
+INSIGHT does **not** use this list (one LLM call + `comment_on_pr`). ACTIVE and ROOT CAUSE do.
+
+- `get_deploy_context(sha: string)` → deploy, baseline, linked PRs, predictions
+- `summarize_telemetry(sha: string)` → n, cost_usd, p50/p95 latency, error_rate, by_model
+- `compare_to_baseline(sha: string)` → deltas + predicted-vs-actual if any prediction maps to this deploy
+- `github_compare(base: string, head: string)` → commits, files, PRs, authors
+- `post_message(content: string, thread_key: string, starts_new_block?: boolean)` → Ambiguous chat (`thread_key` = deploy SHA)
+- `create_poll(question: string, options: string[], close_in_minutes: number)` → `poll_id`
+- `get_poll_results(poll_id: string)` → `total_votes`, options + voters
+- `close_poll(poll_id: string)`
+- `append_ledger(values: string[])` → Sheets append
+- `create_task(title: string, assignee_id: string, priority: "low"|"medium"|"high", due_date: string)`
+- `create_postmortem(title: string, markdown: string)`
+- `comment_on_pr(pr_number: number, body: string)`
+- `execute_rollback(sha: string)` — **hard-gated in code** on an approved poll for that SHA; the model cannot bypass it; writes `pending_reverts`
+
+Ambiguous client (not tools): base `https://app.ambiguous.ai`, headers `Authorization: Bearer <key>` + `API-Version: 1`. Endpoints as in the kickoff (sheet `id` top-level; range query param is `spec`).
+
+## Event flow
+
+```mermaid
+sequenceDiagram
+  participant GH as GitHub
+  participant Agent as AgentExpress
+  participant Demo as DemoApp
+  participant Seed as SeedTraffic
+  participant Worker as Worker
+  participant LLM as OpenAI
+  participant Am as Ambiguous
+
+  GH->>Agent: PR opened
+  Agent->>LLM: INSIGHT estimate
+  Agent->>GH: PR comment
+  Agent->>Agent: write predictions
+
+  GH->>Agent: merge plus deploy hook
+  Agent->>Agent: insert deploys collecting origin release
+
+  Seed->>Demo: 20 plus real LLM requests
+  Demo->>Agent: POST ingest telemetry
+  Worker->>Worker: skip if origin revert
+  Worker->>Worker: wait until n greater_equal 20
+  Worker->>LLM: ACTIVE tools compare_to_baseline
+  alt regression or errors
+    LLM->>Am: alert plus ranked suspects plus predicted vs actual
+    LLM->>Am: approval poll
+    alt poll yes
+      Agent->>Agent: pending_reverts then execute_rollback
+      Agent->>GH: revert or Vercel rollback
+      Note over Worker: new revert deploy skipped_revert
+      LLM->>Am: rollback recorded not evaluated
+    else no or timeout
+      Agent->>Am: I did not roll back, still monitoring
+      Agent->>Am: Task for top suspect
+    end
+  end
+```
+
+1. `POST /webhooks/github` — `pull_request` opened/synchronize → **INSIGHT (required)**. Merged → set `predictions.merged_sha`. Push/deploy → insert `deploys` (`origin=revert` if revert, else `release`).
+2. `POST /ingest` — auth via `INGEST_TOKEN`. Persist telemetry, bump `request_count`. Traffic source: demo app via `seed-traffic.js`.
+3. Worker loop — ignore `origin=revert`. If `collecting` and `request_count >= 20`, evaluate. Else if superseded and still `< 20` → `insufficient_data` (no alert).
+4. Evaluator writes `evaluations` including predicted-vs-actual. If verdict ≠ `ok`, run agent loop. Alert idempotency: `actions.sha` UNIQUE + Ambiguous `thread_key=sha`.
+5. Ranked **suspect list** (never one culprit), each with confidence.
+6. Poll. Worker watches results / `close_at`. Approval → rollback + pending revert. Else monitoring message + Task.
+7. Failure handling lives in the core path (A1–A3), not in a later optional stage. README must list these scenarios (jury reads README, not the source tree).
+
+HTTP: `GET /health`, `POST /ingest`, `POST /webhooks/github`, `POST /deploys` (Vercel), `GET /deploys/:sha`.
+
+## Failure handling (required; implemented in A1–A3)
+
+- **LLM timeout / 5xx** — abort after timeout, one retry, then post a stats-only alert (numbers, no narrative).
+- **GitHub 5xx** — retry with backoff; do not mark the webhook as processed until success.
+- **Idempotency** — `processed_events.delivery_id`; `actions.sha` UNIQUE; Ambiguous `thread_key = sha`. Re-runs do not double-post.
+- **Insufficient data** — never evaluate a deploy with `< MIN_REQUESTS` (20). Superseded and still short → `insufficient_data`, no alert.
+- **Revert loop** — `origin=revert` → `skipped_revert`, never evaluated.
+- **No approval** — poll closes; agent does not roll back; “still monitoring” + Task. Rollback is never automatic.
+- **Bad ingest** — missing token or malformed OTel body rejected; accepted rows are append-only.
+
+A6 is extra drills against this list, not the list itself. If A6 is skipped, this section still appears in README.
+
+## Non-goals
+
+- Slack, PagerDuty, Langfuse UI, multi-tenant SaaS
+- Auto-rollback, buttons/action blocks
+- Perfect token accounting (static USD table is enough)
+- Ambiguous MCP (REST only)
+- Fly.io or any extra host — Dockerfile + local run only
+- Auth beyond ingest token + webhook secret
+- Evaluating a deploy with fewer than 20 requests
+- Evaluating revert/rollback deploys
+- Sheets ledger + postmortem Doc as required surfaces (optional; Task on timeout is part of A4)
+- A6 extra failure-handling drills (the handling itself is required in A1–A3 and must be listed in README)

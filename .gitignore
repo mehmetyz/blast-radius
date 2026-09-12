@@ -1,0 +1,41 @@
+# secrets — never commit
+.env
+.env.*
+!.env.example
+!.env*.example
+*.pem
+*.p12
+*.key
+*.crt
+*.p8
+id_rsa
+id_rsa.pub
+*credentials*.json
+*service-account*.json
+*.secret
+secrets/
+.npmrc
+.vercel
+.wrangler
+
+# dependencies & build
+node_modules/
+dist/
+.next/
+out/
+coverage/
+*.tsbuildinfo
+
+# sqlite / local data
+data/
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+
+# logs & os
+*.log
+.DS_Store
+.idea/
+.vscode/
+*.swp

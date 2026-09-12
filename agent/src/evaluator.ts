@@ -219,18 +219,11 @@ function recordHistory(
   slice: { cost_per_req: number; latency_ms: number; error_rate: number; n: number },
 ) {
   const last = lastHistory.get(sha) as
-    | { verdict: string; actual_cost_delta_pct: number; actual_latency_delta_pct: number; error_rate_delta: number }
+    | { verdict: string }
     | undefined;
-  // Skip when nothing changed since the last recorded evaluation.
-  if (
-    last &&
-    last.verdict === verdict &&
-    Math.abs(last.actual_cost_delta_pct - cost) < 0.01 &&
-    Math.abs(last.actual_latency_delta_pct - latency) < 0.01 &&
-    Math.abs(last.error_rate_delta - errorRate) < 0.0001
-  ) {
-    return;
-  }
+  // One history row per verdict per deploy: re-evaluations with the same
+  // verdict update the existing postmortem/ledger row instead of duplicating it.
+  if (last && last.verdict === verdict) return;
   insertHistory.run(
     sha,
     baselineSha,

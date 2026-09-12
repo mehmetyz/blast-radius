@@ -277,12 +277,14 @@ export async function refreshPostmortems() {
 function cellsForGrid(values: string[][]) {
   const cells: { row: number; column: string; value: string }[] = [];
   const width = Math.max(LEDGER_HEADER.length, ...values.map((r) => r.length));
-  for (let r = 0; r < values.length; r++) {
+  // Pad with blank rows so stale cells from previous (larger) grids are cleared.
+  const height = values.length + 5;
+  for (let r = 0; r < height; r++) {
     for (let c = 0; c < width; c++) {
       cells.push({
         row: r,
         column: String.fromCharCode(65 + c),
-        value: values[r][c] ?? "",
+        value: values[r]?.[c] ?? "",
       });
     }
   }

@@ -1,8 +1,8 @@
 # Blast Radius
 
-**The agent that owns a bad LLM deploy — where your team already works.**
+**The agent that owns a bad deploy — where your team already works.**
 
-Blast Radius joins your workspace as a real member (Ambiguous AI), watches every deploy of your LLM app, and closes the risk loop end to end: it estimates the impact of a pull request *before* merge, verifies that estimate against live traffic *after* deploy, alerts the team with evidence — not opinion — and rolls back the offending commit *only when a human says so*. Every outcome is written back to the workspace: a Task, a postmortem Doc, a Ledger Sheet row. Nobody ever leaves the channel.
+Blast Radius joins your workspace as a real member (Ambiguous AI), watches every deploy, and closes the risk loop end to end: it estimates the impact of a pull request *before* merge, verifies that estimate against live traffic *after* deploy, alerts the team with evidence — not opinion — and rolls back the offending commit *only when a human says so*. Every outcome is written back to the workspace: a Task, a postmortem Doc, a Ledger Sheet row. Nobody ever leaves the channel.
 
 > It's not a chatbot you talk to. It's a teammate that watches production while you keep doing your job.
 
@@ -10,7 +10,9 @@ Blast Radius joins your workspace as a real member (Ambiguous AI), watches every
 
 ## The problem
 
-A bad LLM deploy looks like this: someone bumps `gpt-4o-mini` to `gpt-4o` on Friday. Cost per request jumps 24×. Errors start on the "escalate" path. Nobody notices until the bill arrives — then the rollback is a panic, the blame is a meeting, and the postmortem is a Word doc nobody reads.
+A bad deploy looks like this: someone bumps `gpt-4o-mini` to `gpt-4o` on Friday and cost per request jumps 24×. A commit titled "handle special orders" quietly adds a 503 path. A new endpoint ships without a null check. Nobody notices until the bill arrives or the errors pile up — then the rollback is a panic, the blame is a meeting, and the postmortem is a doc nobody reads.
+
+It's not only about LLM calls. A model swap or a longer prompt changes cost. A new endpoint or a removed null check changes the error rate. A sequential await or an added network call changes latency. Blast Radius reads the whole diff and reports on all three.
 
 Monitoring tools show you dashboards. Blast Radius shows you **which commit did it**, **what it will cost before you merge**, and **a one-command way back** — in the channel where your team already talks.
 
